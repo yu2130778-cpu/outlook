@@ -539,12 +539,17 @@ class CDPBrowser:
         # 并发启动锁：串行化Chrome启动，避免多实例同时启动导致资源竞争崩溃
         # 带重试：并发时 Chrome 偶尔崩溃（exit code 1），最多重试 3 次
         MAX_LAUNCH_RETRIES = 3
+        chrome_err_file = None
         for _launch_attempt in range(MAX_LAUNCH_RETRIES):
             with _LAUNCH_LOCK:
+                err_dir = Path("/home/workspace/Email-Register/runtime_outlook/logs")
+                err_dir.mkdir(parents=True, exist_ok=True)
+                chrome_err_path = err_dir / f"chrome_{self._port}_{_launch_attempt + 1}.err"
+                chrome_err_file = open(chrome_err_path, "w", encoding="utf-8")
                 self._process = subprocess.Popen(
                     args,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=chrome_err_file,
                 )
                 # 等待一小段时间让Chrome进程稳定，再启动下一个
                 time.sleep(2)
@@ -552,8 +557,12 @@ class CDPBrowser:
             # 检查 Chrome 是否立即崩溃
             if self._process.poll() is not None:
                 exit_code = self._process.returncode
-                logger.warning("[CDP] Chrome exited immediately with code %d (attempt %d/%d)",
-                               exit_code, _launch_attempt + 1, MAX_LAUNCH_RETRIES)
+                try:
+                    chrome_err_file.close()
+                except Exception:
+                    pass
+                logger.warning("[CDP] Chrome exited immediately with code %d (attempt %d/%d), stderr=%s",
+                               exit_code, _launch_attempt + 1, MAX_LAUNCH_RETRIES, chrome_err_path)
                 if _launch_attempt < MAX_LAUNCH_RETRIES - 1:
                     # 清理旧的 temp dir，重新创建
                     if self._temp_dir:

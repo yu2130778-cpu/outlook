@@ -31,8 +31,18 @@ logger = logging.getLogger(__name__)
 # ─── 常量 ───
 MIHOMO_DIR = Path(__file__).parent / "mihomo_runtime"
 MIHOMO_EXE = MIHOMO_DIR / "mihomo.exe"
+MIHOMO_LINUX = MIHOMO_DIR / "mihomo-linux"
 CONFIG_PATH = MIHOMO_DIR / "config.yaml"
 SUBS_FILE = MIHOMO_DIR / "subscriptions.json"
+
+
+def _mihomo_executable() -> Path:
+    """Return the platform-appropriate mihomo executable."""
+    if sys.platform == "win32":
+        return MIHOMO_EXE
+    if MIHOMO_LINUX.exists():
+        return MIHOMO_LINUX
+    return MIHOMO_EXE
 
 MIXED_PORT = 28888       # HTTP+SOCKS5 混合代理端口
 API_PORT = 29090         # mihomo RESTful API 端口
@@ -266,8 +276,11 @@ class SubscriptionProxyManager:
         if not self._subscriptions:
             return False, "没有订阅链接，请先添加订阅"
 
-        # 更新配置
-        if not self._update_config():
+        # 更新配置（快速启动模式下复用已有配置，避免每次启动都重新拉取大量订阅）
+        fast_start = os.environ.get("SUB_PROXY_FAST_START") == "1" and CONFIG_PATH.exists()
+        if fast_start:
+            logger.info("[mihomo] 快速启动：复用已有配置 %s", CONFIG_PATH)
+        elif not self._update_config():
             return False, "配置文件更新失败"
 
         # 清理旧进程
@@ -279,7 +292,7 @@ class SubscriptionProxyManager:
 
         # 启动 mihomo
         try:
-            cmd = [str(MIHOMO_EXE), "-d", str(MIHOMO_DIR), "-f", str(CONFIG_PATH)]
+            cmd = [str(_mihomo_executable()), "-d", str(MIHOMO_DIR), "-f", str(CONFIG_PATH)]
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -509,8 +522,9 @@ class SubscriptionProxyManager:
         """创建一个独立的 mihomo 工作实例，使用指定节点和端口。
         用于并发注册：每个并发任务一个独立实例，互不干扰。
         返回 (ok, proxy_url_or_error, process)"""
-        if not MIHOMO_EXE.exists():
-            return False, "mihomo.exe 不存在", None
+        exe = _mihomo_executable()
+        if not exe.exists():
+            return False, f"mihomo 不存在: {exe}", None
         if _check_port("127.0.0.1", port):
             return False, f"端口 {port} 已被占用", None
 
@@ -549,7 +563,7 @@ class SubscriptionProxyManager:
 
         # 启动 mihomo
         try:
-            cmd = [str(MIHOMO_EXE), "-d", str(worker_dir), "-f", str(worker_cfg)]
+            cmd = [str(exe), "-d", str(worker_dir), "-f", str(worker_cfg)]
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

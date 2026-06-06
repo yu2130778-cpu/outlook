@@ -1902,14 +1902,23 @@ def _fill_birthdate(browser: CDPBrowser, account: OutlookAccount) -> bool:
     
     time.sleep(random.uniform(0.3, 0.5))
     
-    # Birth month - Fluent UI: click dropdown, then click option with matching month number
+    # Birth month - Fluent UI: click dropdown, then click option with matching month name/number
     month_num = int(account.birth_month)
-    _click_fluent_dropdown_option(browser, "#BirthMonthDropdown", "BirthMonth", str(month_num))
+    month_names = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+    _click_fluent_dropdown_option(
+        browser,
+        "#BirthMonthDropdown",
+        "BirthMonth",
+        [str(month_num), f"{month_num}月", month_names[month_num - 1]],
+    )
     time.sleep(random.uniform(0.3, 0.5))
     
-    # Birth day - Fluent UI: click dropdown, then click option with matching day number
+    # Birth day - Fluent UI: click dropdown, then click exact day option
     day_num = int(account.birth_day)
-    _click_fluent_dropdown_option(browser, "#BirthDayDropdown", "BirthDay", str(day_num))
+    _click_fluent_dropdown_option(browser, "#BirthDayDropdown", "BirthDay", [str(day_num)])
     time.sleep(random.uniform(0.3, 0.5))
     
     _click_next(browser)
@@ -1917,7 +1926,7 @@ def _fill_birthdate(browser: CDPBrowser, account: OutlookAccount) -> bool:
     return True
 
 
-def _click_fluent_dropdown_option(browser: CDPBrowser, button_id: str, name_hint: str, target_num: str) -> bool:
+def _click_fluent_dropdown_option(browser: CDPBrowser, button_id: str, name_hint: str, target_texts) -> bool:
     """Click a Fluent UI Dropdown button and select an option by keyboard navigation."""
     # Click the dropdown button to open it
     nid = browser.query_selector(button_id)
@@ -1933,24 +1942,28 @@ def _click_fluent_dropdown_option(browser: CDPBrowser, button_id: str, name_hint
     time.sleep(0.8)
     
     # Get the list of option texts to find the target index
-    target_text = f"{target_num}\u6708"  # e.g. "7月"
+    if isinstance(target_texts, str):
+        targets = [target_texts]
+    else:
+        targets = [str(t) for t in target_texts]
     result = browser.evaluate(f"""
         (() => {{
+            const targets = {json.dumps(targets, ensure_ascii=False)};
             const options = document.querySelectorAll('[role=option]');
             const texts = [];
             let targetIdx = -1;
             for (let i = 0; i < options.length; i++) {{
                 const t = (options[i].textContent || '').trim();
                 texts.push(t);
-                if (t === '{target_num}' || t === '{target_text}' || t.startsWith('{target_num}')) {{
+                if (targets.some(x => t === x || t.toLowerCase() === x.toLowerCase())) {{
                     targetIdx = i;
+                    break;
                 }}
             }}
             return JSON.stringify({{texts, targetIdx, count: options.length}});
         }})()
     """)
     if result:
-        import json
         data = json.loads(result)
         logger.info("[FILL] Options: %s, target index: %d", data["texts"][:5], data["targetIdx"])
         if data["targetIdx"] >= 0:
@@ -1966,7 +1979,7 @@ def _click_fluent_dropdown_option(browser: CDPBrowser, button_id: str, name_hint
             browser.press_key("Enter")
             logger.info("[FILL] Selected option at index %d", data["targetIdx"])
         else:
-            logger.warning("[FILL] Target option '%s' not found in list", target_num)
+            logger.warning("[FILL] Target option '%s' not found in list", targets)
             browser.press_key("Escape")
     else:
         logger.warning("[FILL] Could not read dropdown options")

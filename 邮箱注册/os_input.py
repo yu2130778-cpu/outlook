@@ -363,7 +363,7 @@ def os_dismiss_webauthn_dialog(timeout: float = 5.0) -> bool:
     
     # Dialog never appeared or was already dismissed
     logger.info("[OS_INPUT] No WebAuthn dialog found (timeout=%.0fs)", timeout)
-    return False)
+    return False
 
 
 def _char_to_vk(char: str) -> int | None:
