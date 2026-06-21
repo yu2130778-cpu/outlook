@@ -90,48 +90,61 @@ def fetch_rt_batch(
     start_port: int = 20000,
     display: str = ":98",
 ) -> dict:
-    """调用 batch_rt.py 批量获取 RT。"""
+    """使用 Device Code 流程批量获取 RT（更可靠，不需要 localhost 回调）。"""
     if not emails:
         return {"total": 0, "success": 0, "fail": 0}
 
-    input_dir = ROOT / "runtime_outlook" / "rt_input"
-    prepare_input_files(emails, input_dir)
+    import sys
+    sys.path.insert(0, str(ROOT / "邮箱注册"))
+    from cdp_outlook import _extract_refresh_token_device_code, CDPBrowser, CDPLaunchConfig
 
-    env = os.environ.copy()
-    env["DISPLAY"] = display
+    success = 0
+    fail = 0
+    timeout_count = 0
 
-    import subprocess
-    cmd = [
-        sys.executable, "-u", str(TOOL_DIR / "batch_rt.py"),
-        "--input-dir", str(input_dir),
-        "--output-dir", str(RT_DIR),
-        "--workers", "1",
-        "--timeout", str(timeout_per_account),
-        "--start-port", str(start_port),
-        "--tenant", "consumers",
-    ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=len(emails) * (timeout_per_account + 30))
-    
-    # Parse output
-    output = proc.stdout + proc.stderr
-    success = output.count("OK ")
-    timeout = output.count("TO ")
-    fail = output.count("ER ") + output.count("WP ") + output.count("NE ")
+    for d in emails:
+        email = d["email"]
+        password = d.get("password", "")
+        client_id = d.get("client_id", "14d82eec-204b-4c2f-b7e8-296a70dab67e")
+        print(f"[POST-RT] Device Code 获取 RT: {email}")
 
-    # Write back RT to results.jsonl
-    rt_files = list(RT_DIR.glob("*.txt"))
-    for f in rt_files:
-        content = f.read_text(encoding="utf-8").strip()
-        parts = content.split("----")
-        if len(parts) >= 4 and parts[3].strip() and len(parts[3].strip()) > 20:
-            write_back_rt(parts[0], parts[3].strip())
+        cfg = CDPLaunchConfig(browser_type="chrome", proxy="", headless=True)
+        browser = CDPBrowser(cfg)
+        browser.start()
+        try:
+            rt = _extract_refresh_token_device_code(
+                browser, email, client_id,
+                password=password, proxy_url="",
+                timeout=timeout_per_account,
+            )
+            if rt and len(rt) > 20:
+                write_back_rt(email, rt)
+                # Save to RT_DIR
+                fname = re.sub(r'[^a-z0-9@._-]+', '_', email.lower()) + ".txt"
+                (RT_DIR / fname).write_text(
+                    f"{email}----{password}----{client_id}----{rt}",
+                    encoding="utf-8"
+                )
+                success += 1
+                print(f"[POST-RT] ✅ {email}: RT 获取成功")
+            else:
+                fail += 1
+                print(f"[POST-RT] ❌ {email}: RT 获取失败")
+        except Exception as e:
+            fail += 1
+            print(f"[POST-RT] ❌ {email}: {e}")
+        finally:
+            try:
+                browser.stop()
+            except Exception:
+                pass
 
     return {
         "total": len(emails),
         "success": success,
-        "timeout": timeout,
+        "timeout": timeout_count,
         "fail": fail,
-        "output": output[-500:] if len(output) > 500 else output,
+        "output": f"Device Code flow: {success}/{len(emails)} succeeded",
     }
 
 

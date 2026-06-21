@@ -70,13 +70,17 @@ proxy = get_manager().proxy_url or ""
 email = sys.argv[1] if len(sys.argv) > 1 else ""
 password = sys.argv[2] if len(sys.argv) > 2 else ""
 
-from cdp_outlook import _extract_refresh_token, CDPBrowser, CDPLaunchConfig
+from cdp_outlook import _extract_refresh_token_device_code, _extract_refresh_token, CDPBrowser, CDPLaunchConfig
 
 cfg = CDPLaunchConfig(browser_type="chrome", proxy=proxy, headless=False)
 browser = CDPBrowser(cfg)
 browser.start()
 try:
-    rt = _extract_refresh_token(browser, email, password=password, proxy_url=proxy)
+    # 优先使用 Device Code 流程（更可靠，不需要 localhost 回调）
+    rt = _extract_refresh_token_device_code(browser, email, password=password, proxy_url=proxy)
+    if not rt:
+        print("Device Code 流程未获取到 RT，尝试 Authorization Code 流程...")
+        rt = _extract_refresh_token(browser, email, password=password, proxy_url=proxy)
     print("RT_OK:", rt[:30] if rt else "EMPTY")
 finally:
     browser.stop()

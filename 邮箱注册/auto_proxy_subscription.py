@@ -81,7 +81,7 @@ def register_via_hidexx_cli(log_fn: Callable[[str], None]) -> str | None:
         os.getenv("HIDEXX_BIN", ""),
         str(root.parent / "hidexx" / "hidexx-linux"),
         str(Path.home() / "hidexx" / "hidexx-linux"),
-        str(Path.home() / "hidexx" / "hidexx-linux"),
+        "/home/workspace/hidexx/hidexx-linux",
     ]
     bin_path = next((Path(x) for x in candidates if x and Path(x).exists()), None)
     if not bin_path:

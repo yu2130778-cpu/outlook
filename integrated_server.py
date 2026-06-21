@@ -396,6 +396,54 @@ async def fetch_by_token(req: FetchMailRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# --------------- Device Code RT Extraction API ---------------
+class FetchRTRequest(BaseModel):
+    email: str
+    password: str
+    client_id: str = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+    proxy: str = ""
+
+class BatchFetchRTRequest(BaseModel):
+    items: List[FetchRTRequest]
+
+@app.post("/api/fetch_rt")
+async def fetch_rt_single(req: FetchRTRequest):
+    """使用 Device Code 流程为单个账号获取 refresh_token"""
+    try:
+        from 邮箱注册.cdp_outlook import _extract_refresh_token_device_code, CDPBrowser, CDPLaunchConfig
+        from 邮箱注册.proxy_utils import parse_proxy
+
+        proxy_info = parse_proxy(req.proxy) if req.proxy else None
+        proxy_url = proxy_info.chrome_proxy if proxy_info else ""
+        proxy_auth_url = proxy_info.url if proxy_info and proxy_info.has_auth else ""
+
+        cfg = CDPLaunchConfig(browser_type="chrome", proxy=proxy_url, headless=True)
+        browser = CDPBrowser(cfg)
+        browser.start()
+        try:
+            rt = _extract_refresh_token_device_code(
+                browser, req.email, req.client_id,
+                password=req.password, proxy_url=proxy_auth_url or proxy_url
+            )
+            if rt:
+                return {"status": "ok", "email": req.email, "refresh_token": rt}
+            else:
+                return {"status": "error", "email": req.email, "message": "Device Code 流程未获取到 RT"}
+        finally:
+            browser.stop()
+    except Exception as e:
+        return {"status": "error", "email": req.email, "message": str(e)}
+
+@app.post("/api/fetch_rt_batch")
+async def fetch_rt_batch(req: BatchFetchRTRequest):
+    """批量使用 Device Code 流程获取 refresh_token"""
+    results = []
+    for item in req.items:
+        result = await fetch_rt_single(item)
+        results.append(result)
+    success_count = sum(1 for r in results if r.get("status") == "ok")
+    return {"status": "ok", "total": len(results), "success": success_count, "results": results}
+
 # --------------- Merge Files API ---------------
 import glob as glob_mod
 
