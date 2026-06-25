@@ -31,7 +31,7 @@ PKG = ROOT / "邮箱注册"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(PKG))
 
-from 邮箱注册.cdp_outlook import register_outlook_account, kill_orphan_chrome_processes
+from 邮箱注册.cdp_outlook import register_outlook_account, kill_orphan_chrome_processes, CDPBrowser, CDPLaunchConfig, _extract_refresh_token_device_code
 from 邮箱注册.proxy_utils import parse_proxies, parse_proxy
 from 邮箱注册.subscription_proxy import get_manager
 
@@ -174,6 +174,41 @@ def write_result(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _retry_fetch_rt_with_fresh_browser(email: str, password: str, client_id: str, timeout: int = 120) -> str:
+    """注册成功但未拿到RT时，用全新干净的浏览器通过 Device Code 补获取 refresh_token。
+
+    注册流程内嵌的RT获取复用同一个（可能已腐化的）浏览器，成功率低；
+    这里每次新开一个干净的 CDPBrowser，与手动 batch 同款配置，成功率更高。
+    """
+    log.info("[RT-RETRY] 注册成功但未拿到RT，用全新浏览器补获取: %s", email)
+    cfg = CDPLaunchConfig(browser_type="chrome", proxy="", headless=False)
+    browser = CDPBrowser(cfg)
+    browser.start()
+    try:
+        rt = _extract_refresh_token_device_code(
+            browser, email, client_id,
+            password=password, proxy_url="",
+            timeout=timeout,
+        )
+        if rt and len(rt) > 20:
+            log.info("[RT-RETRY] ✅ %s: RT 补获取成功", email)
+            return rt
+        log.warning("[RT-RETRY] ❌ %s: RT 补获取失败", email)
+        return ""
+    except Exception as e:
+        log.warning("[RT-RETRY] ❌ %s: 补获取异常: %s", email, e)
+        return ""
+    finally:
+        try:
+            browser.stop()
+        except Exception:
+            pass
+        try:
+            kill_orphan_chrome_processes()
+        except Exception:
+            pass
+
+
 def run_once(proxy: str, browser: str = "chrome", extract_rt: bool = True, slot_index: int = 0) -> dict:
     if proxy:
         check = curl_check_proxy(proxy)
@@ -207,6 +242,16 @@ def run_once(proxy: str, browser: str = "chrome", extract_rt: bool = True, slot_
         "proxy": proxy,
         "screenshot_path": result.screenshot_path,
     }
+    # ── 注册成功但未拿到RT时，立即用全新浏览器补获取RT（趁密码还在内存里直接出四凭证）──
+    if record.get("success") and not (record.get("refresh_token") and len(record["refresh_token"]) > 20):
+        retry_rt = _retry_fetch_rt_with_fresh_browser(
+            record.get("email", ""),
+            record.get("password", ""),
+            record.get("client_id") or "14d82eec-204b-4c2f-b7e8-296a70dab67e",
+            timeout=120,
+        )
+        if retry_rt and len(retry_rt) > 20:
+            record["refresh_token"] = retry_rt
     write_result(record)
     # ── 每次注册后清理孤儿 Chrome 进程 ──
     try:
