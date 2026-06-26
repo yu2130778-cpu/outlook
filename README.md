@@ -381,3 +381,187 @@ python3 -c "from 邮箱注册.cdp_outlook import kill_orphan_chrome_processes; k
 - 建议每台节点的守护程序配置中加入定期清理（已内置在 daemon 流程中）
 
 ## 自动化运维部署
+
+---
+
+## 🔑 关键注意事项（必读）
+
+> 本章节记录了实际部署运行中踩过的坑和关键注意事项。部署前务必完整阅读。
+
+### 1. 敏感文件保护（Git 安全）
+
+**绝对不要推送到 Git 的内容：**
+
+| 文件/目录 | 敏感内容 | 已加入 .gitignore |
+|-----------|----------|-------------------|
+| `邮箱注册/mihomo_runtime/` | 节点服务器 IP/UUID/Reality 密钥 + 订阅链接 | ✅ |
+| `邮箱注册/mihomo_runtime/subscriptions.json` | 订阅 URL（含 token） | ✅ |
+| `邮箱注册/mihomo_runtime/config.yaml` | clash 节点配置（含服务器+密码） | ✅ |
+| `邮箱注册/mihomo_runtime/providers/sub_*.yaml` | 各订阅节点列表 | ✅ |
+| `邮箱注册/mihomo_runtime/residential_proxies.json` | 住宅代理密钥 | ✅ |
+| `runtime_outlook/` | 注册结果（邮箱+密码+RT）+ 日志 + 截图 | ✅ |
+| `云端注册邮箱/` | GitHub 凭证仓库（三凭证/四凭证） | ✅ |
+| `实验优化版本/` | 旧版实验代码 + mihomo_runtime | ✅ |
+| `自动化定时注册Outlook邮箱/` | 历史凭证 | ✅ |
+| `runtime_subscriptions.json` | 运行时订阅缓存 | ✅ |
+| `vostuo_accounts.json` | 账号信息 | ✅ |
+| `runtime_nodes_cache.json` | 节点缓存（含 IP） | ✅ |
+| `*.pem` `*.key` `.env` | 密钥/环境变量 | ✅ |
+
+**历史已清理：** 使用 `git filter-repo` 已从所有历史提交中移除上述敏感文件。如需重新清理：
+
+```bash
+pip install git-filter-repo
+git filter-repo --force --invert-paths \
+  --path 邮箱注册/mihomo_runtime \
+  --path 云端注册邮箱 \
+  --path 实验优化版本 \
+  --path 自动化定时注册Outlook邮箱 \
+  --path runtime_subscriptions.json \
+  --path vostuo_accounts.json
+git remote add origin https://github.com/xxx/outlook-auto-register.git
+git push --force origin main
+```
+
+### 2. 双代理内核架构
+
+系统支持两个代理内核并行运行，端口互不冲突：
+
+| 内核 | 端口 | 协议支持 | 用途 |
+|------|------|----------|------|
+| **Xray-core** | socks `28889` / http `28890` | VLESS + Reality + XTLS | **主内核**（注册轮循用） |
+| **mihomo (Clash.Meta)** | mixed `28888` / api `29090` | Clash 全协议 | 兜底内核 |
+| 独立 xray VPN | `443` | VLESS | 用户独立 VPN，**不要触碰** |
+
+**端口冲突排查：** 如果注册失败提示 "端口被占用"：
+```bash
+ss -tlnp | grep -E '28888|28889|28890'
+# 杀残留进程（只杀注册相关的，不碰 VPN）
+pkill -f 'mihomo-linux.*邮箱注册' 2>/dev/null
+pkill -f 'xray.*xray_runtime' 2>/dev/null
+```
+
+### 3. 代理节点轮循机制
+
+**轮循策略：按节点轮循（不是按 IP 去重）**
+
+- 每次注册自动切换到下一个可用节点
+- 遍历全部节点后才算一轮，之后重新开始
+- `account_blocked` 时将该**节点**拉黑 4 小时（不是 IP）
+- 台湾/日本节点优先排序（成功率最高）
+- 状态持久化在 `runtime_outlook/proxy_rotation.json`
+
+**⚠️ 并行模式注意：**
+- 2 线程并行时，同一节点会被多个注册共享
+- 如果一个线程 blocked，会拉黑该节点 → 另一线程也会受影响
+- **建议串行模式（workers=1）**，成功率更高
+- 并行模式适合"快速过一遍所有节点"的场景
+
+### 4. RT（Refresh Token）获取
+
+**两种获取路径：**
+
+1. **注册后同浏览器获取**（注册成功后直接在当前浏览器走 OAuth 授权流程）
+   - 优点：复用浏览器会话，速度快
+   - 风险：注册成功后跳转到 OAuth 授权页可能卡在"unknown"状态
+
+2. **新浏览器批量获取**（`batch_rt.py`，用 Playwright 全新实例）
+   - 优点：干净环境，不受注册会话干扰
+   - 用法：`post_register_fetch_rt.py --limit 10 --timeout 90`
+   - 每个账号开一个全新 Chrome，带 `login_hint` 直接到密码页
+
+**关键：** 新浏览器不需要登录态——它通过 OAuth `device-code` 或 `authorization-code` flow 重新登录获取 RT，与注册时的浏览器会话无关。
+
+**batch_rt.py 核心流程：**
+```
+1. 构造 OAuth URL（含 PKCE + login_hint=email + prompt=login）
+2. Playwright 开新 Chrome → goto OAuth URL
+3. 自动填邮箱密码（login_hint 已预填邮箱）
+4. 处理 consent 授权页（自动点 Accept）
+5. 等待 localhost 回调拿到 authorization code
+6. 用 code 换 token → 保存 refresh_token
+```
+
+### 5. 常见失败原因与排查
+
+| 现象 | 根因 | 解决 |
+|------|------|------|
+| `account_blocked` | Outlook 检测到自动化注册 | 换节点（已自动拉黑当前节点 4h） |
+| `unknown` 死循环 | 注册成功后跳转 OAuth 页，页面检测器不认识 | 快速检测 OAuth URL → 触发新浏览器获取 RT |
+| RT 获取超时 | 账号选择页卡住 / 密码错误 / consent 页没点 | 新浏览器重试（batch_rt.py 已内置重试） |
+| Chrome OOM (exit 137) | 内存不足，多个 Chrome 实例堆积 | 串行注册 + 每次 `kill_orphan_chrome_processes()` |
+| 代理 SSL 失败 | 节点不稳定 / 订阅过期 | `ensure_mihomo_proxy.sh` 自动重新拉订阅 |
+| mihomo 端口 28888 不通 | 进程崩溃但端口锁残留 | 重启 mihomo（`subscription_proxy.py` 的 `start()`） |
+
+### 6. Xvfb 虚拟显示
+
+- 注册必须用**可视实体浏览器**（非 headless），Outlook 会检测 headless 并拦截
+- Xvfb `:98` 提供虚拟显示，所有 Chrome 子进程必须 `export DISPLAY=:98`
+- **僵尸锁文件：** Xvfb 进程死后 `/tmp/.X98-lock` 仍残留 → 新 Xvfb 起不来
+  ```bash
+  rm -f /tmp/.X98-lock /tmp/.X11-unix/X98
+  Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &
+  ```
+
+### 7. 凭证管理
+
+**三凭证 → 四凭证升级：**
+- 注册成功 = 三凭证（`email----password----client_id`）
+- RT 获取成功 = 四凭证（`email----password----client_id----refresh_token`）
+- `sync_credentials.py` 自动同步到 GitHub 私有仓库 `cloud-register-email`
+- 每天 00:00 自动推送，每轮注册后也会推送
+
+### 8. 守护进程保活
+
+- Zo 服务器：用 `register_user_service` + supervisor 自动重启
+- VPS/Gcore：用 systemd 服务
+- 守护进程每 4 小时注册一批（默认 5 个），串行执行
+- **调度状态残留坑：** 注册失败后 `daemon_schedule.json` 残留时间戳 → 重置：
+  ```bash
+  echo "{}" > runtime_outlook/daemon_schedule.json
+  ```
+
+### 9. `__pycache__` 缓存陷阱
+
+修改 Python 代码后，`__pycache__` 中的旧 `.pyc` 可能导致修复不生效：
+
+```bash
+find 邮箱注册 -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+```
+
+**每次修改代码后务必清理缓存再重新运行。**
+
+### 10. 部署前置检查清单
+
+```bash
+# 1. 内存 ≥ 3GB 可用
+free -m
+
+# 2. 磁盘 ≥ 3GB 可用
+df -h /
+
+# 3. Xvfb 运行中
+pgrep -f "Xvfb :98"
+
+# 4. 代理内核运行中
+ss -tlnp | grep -E '28889|28890'  # xray
+ss -tlnp | grep 28888             # mihomo
+
+# 5. 代理出口可用
+curl -s --max-time 10 --proxy http://127.0.0.1:28890 https://ipinfo.io/json
+
+# 6. 无幽灵 Chrome
+pgrep -af 'google-chrome.*outlook' | grep -v agent-browser
+
+# 7. Python 缓存已清
+find 邮箱注册 -name "__pycache__" -type d | wc -l  # 应为 0
+```
+
+---
+
+## 📚 相关文档
+
+- [部署指南](DEPLOY_GUIDE.md) — 详细的一键部署步骤（支持 Zo/VPS/Gcore）
+- [优化记录](OPTIMIZATION_LOG.md) — 历次优化要点与变更记录
+- [根因分析](ROOT_CAUSE_ANALYSIS.md) — 注册失败的根本原因分析
+- [运维笔记](OPERATIONS.md) — 日常运维操作手册
