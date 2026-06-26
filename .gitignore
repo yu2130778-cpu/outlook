@@ -36,16 +36,15 @@ runtime_outlook/
 自动化定时注册Outlook邮箱/
 实验优化版本/
 
-# ============ Proxy runtime (NEVER commit - contains subscription links & node secrets) ============
-邮箱注册/mihomo_runtime/subscriptions.json
-邮箱注册/mihomo_runtime/config.yaml
-邮箱注册/mihomo_runtime/cache.db
-邮箱注册/mihomo_runtime/cache.db-shm
-邮箱注册/mihomo_runtime/cache.db-wal
-邮箱注册/mihomo_runtime/*.yaml
-邮箱注册/mihomo_runtime/*.db
-邮箱注册/xray_runtime/
-邮箱注册/hidexx/
+# Proxy runtime (contains subscription URLs, node configs, binaries)
+**/mihomo_runtime/
+**/xray_runtime/
+**/subscriptions.json
+**/runtime_subscriptions.json
+**/config.yaml
+**/providers/
+**/mihomo-linux
+**/mihomo.exe
 
 # Screenshots and images
 *.png
