@@ -382,6 +382,14 @@ python3 -c "from 邮箱注册.cdp_outlook import kill_orphan_chrome_processes; k
 
 ## 自动化运维部署
 
+> **📋 完整部署指南（给其他服务器 AI 用）**: 见 [AI_DEPLOY_GUIDE.md](AI_DEPLOY_GUIDE.md) — 适配 Zo / Gcore / AWS / 阿里云 / 通用 VPS，含环境检测、双内核代理、保活配置、验证清单、排障速查。
+>
+> **🔧 Zo 服务器专项指南**: 见 [DEPLOY_GUIDE.md](DEPLOY_GUIDE.md) — 针对 Zo Computer 环境的快速部署。
+>
+> **📊 优化记录**: 见 [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) — 轮循/黑名单/RT 并行获取等优化要点。
+>
+> **🔍 失败根因分析**: 见 [ROOT_CAUSE_ANALYSIS.md](ROOT_CAUSE_ANALYSIS.md) — account_blocked 原因与解决方案。
+
 ---
 
 ## 🔑 关键注意事项（必读）
