@@ -110,7 +110,7 @@ def fetch_rt_batch(
 
         cfg = CDPLaunchConfig(browser_type="chrome", proxy="", headless=True)
         browser = CDPBrowser(cfg)
-        browser.start()
+        browser.launch()
         try:
             rt = _extract_refresh_token_device_code(
                 browser, email, client_id,
@@ -135,7 +135,7 @@ def fetch_rt_batch(
             print(f"[POST-RT] ❌ {email}: {e}")
         finally:
             try:
-                browser.stop()
+                browser.close()
             except Exception:
                 pass
 

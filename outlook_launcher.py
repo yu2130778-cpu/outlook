@@ -181,9 +181,9 @@ def _retry_fetch_rt_with_fresh_browser(email: str, password: str, client_id: str
     这里每次新开一个干净的 CDPBrowser，与手动 batch 同款配置，成功率更高。
     """
     log.info("[RT-RETRY] 注册成功但未拿到RT，用全新浏览器补获取: %s", email)
-    cfg = CDPLaunchConfig(browser_type="chrome", proxy="", headless=False)
+    cfg = CDPLaunchConfig(browser_type="chrome", proxy="", headless=True)
     browser = CDPBrowser(cfg)
-    browser.start()
+    browser.launch()
     try:
         rt = _extract_refresh_token_device_code(
             browser, email, client_id,
@@ -200,7 +200,7 @@ def _retry_fetch_rt_with_fresh_browser(email: str, password: str, client_id: str
         return ""
     finally:
         try:
-            browser.stop()
+            browser.close()
         except Exception:
             pass
         try:

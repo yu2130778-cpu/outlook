@@ -744,10 +744,10 @@ th{color:var(--muted);font-weight:500}
 <div class="card" style="margin-top:.8rem">
   <h2>手动操作</h2>
   <div class="btn-row">
-    <button class="btn" onclick="doAction('register_1')">📝 注册 1 个</button>
-    <button class="btn" onclick="doAction('register_5')">📝 注册 5 个</button>
-    <button class="btn warn" onclick="doAction('fetch_rt')">🔑 获取 RT</button>
-    <button class="btn" onclick="doAction('push_github')">📤 推送 GitHub</button>
+    <button class="btn" onclick="doAction('register_1', event)">📝 注册 1 个</button>
+    <button class="btn" onclick="doAction('register_5', event)">📝 注册 5 个</button>
+    <button class="btn warn" onclick="doAction('fetch_rt', event)">🔑 获取 RT</button>
+    <button class="btn" onclick="doAction('push_github', event)">📤 推送 GitHub</button>
   </div>
   <p style="font-size:.75rem;color:var(--muted);margin:0">🔑 获取 RT = 仅为本地三凭证（无RT）账号获取 refresh_token</p>
   <pre id="action_log" style="display:none"></pre>
@@ -890,25 +890,41 @@ async function api(path, method='GET', body=null) {
 }
 
 // ─── 手动操作 ───
-async function doAction(action) {
-  const btn = event.target;
-  btn.disabled = true;
-  const orig = btn.textContent;
-  btn.textContent = '⏳ 执行中...';
+async function doAction(action, ev) {
+  const btn = ev ? ev.currentTarget : null;
+  if (btn) { btn.disabled = true; }
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '⏳ 执行中...'; }
   const logEl = $('action_log');
   logEl.style.display = 'block';
   logEl.textContent = '正在执行 ' + action + ' ...';
   try {
-
-  pollProgress();
     const d = await api('/api/action/' + action, 'POST');
-    if (d.ok) { toast('✅ ' + d.msg); } else { toast('❌ ' + d.msg, 'err'); }
-    logEl.textContent = d.output || d.msg;
+    if (d.accepted) {
+      toast('✅ 已启动 ' + action + '，进度面板实时更新');
+      startProgressPolling();
+    } else if (d.ok) {
+      toast('✅ ' + d.msg);
+      logEl.textContent = d.output || d.msg;
+    } else {
+      toast('❌ ' + d.msg, 'err');
+      logEl.textContent = d.output || d.msg;
+    }
   } catch(e) { toast('❌ 请求失败: ' + e, 'err'); }
-  btn.disabled = false;
-  btn.textContent = orig;
-  setTimeout(() => location.reload(), 2000);
+  if (btn) { btn.disabled = false; btn.textContent = orig; }
 }
+
+function startProgressPolling() {
+  stopProgressPolling();
+  showProgress();
+  progressTimer = setTimeout(pollProgress, 500);
+}
+
+function stopProgressPolling() {
+  if (progressTimer) { clearTimeout(progressTimer); progressTimer = null; }
+}
+
+window.addEventListener('beforeunload', stopProgressPolling);
 
 // ─── 代理状态 ───
 async function loadProxyStatus() {
@@ -1237,28 +1253,31 @@ function clearStatus() {
 }
 
 async function pollProgress() {
+  progressTimer = null;
   try {
     const r = await fetch('/api/register/progress');
-    if (r.ok) {
-      const data = await r.json();
-      if (data.active) {
-        showProgress();
-        updateProgress(data.percent || 0, data.text || '处理中...');
-        if (data.logs && data.logs.length > 0) {
-          clearStatus();
-          data.logs.forEach(log => appendStatus(log));
-        }
-        if (data.percent < 100) {
-          setTimeout(pollProgress, 1000);
-        } else {
-          setTimeout(hideProgress, 3000);
-        }
-      } else {
-        hideProgress();
+    if (!r.ok) { progressTimer = setTimeout(pollProgress, 2000); return; }
+    const data = await r.json();
+    if (data.active) {
+      showProgress();
+      updateProgress(data.percent || 0, data.text || '处理中...');
+      if (data.logs && data.logs.length > 0) {
+        clearStatus();
+        data.logs.forEach(log => appendStatus(log));
       }
+      if (data.percent < 100) {
+        progressTimer = setTimeout(pollProgress, 1000);
+      } else {
+        toast('✅ 任务完成');
+        progressTimer = setTimeout(() => { hideProgress(); stopProgressPolling(); loadProxyStatus(); }, 3000);
+      }
+    } else {
+      hideProgress();
+      stopProgressPolling();
     }
   } catch(e) {
     console.error('Progress poll error:', e);
+    progressTimer = setTimeout(pollProgress, 3000);
   }
 }
 
