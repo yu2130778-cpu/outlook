@@ -259,8 +259,19 @@ def main():
 
     def worker(item):
         idx, (email, pwd, cid) = item
-        return process_one(email, pwd, cid, args.start_port + idx,
-                           args.output_dir, args.tenant, scopes, args.timeout)
+        r = process_one(email, pwd, cid, args.start_port + idx,
+                       args.output_dir, args.tenant, scopes, args.timeout)
+        # 失败时用新浏览器实例重试（换端口避免冲突；确定性失败不重试）
+        if r.status not in ("success", "not_exist", "wrong_password"):
+            print(f"[RETRY] {email} 首次失败({r.status})，新浏览器重试...")
+            time.sleep(3)
+            r2 = process_one(email, pwd, cid, args.start_port + idx + 10000,
+                            args.output_dir, args.tenant, scopes, args.timeout)
+            if r2.status == "success":
+                r2.email = email
+                return r2
+            print(f"[RETRY] {email} 重试仍失败({r2.status})")
+        return r
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(worker, (i, c)): c for i, c in enumerate(creds)}

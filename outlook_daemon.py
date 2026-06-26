@@ -70,6 +70,57 @@ DISPLAY_ID = ":98"
 REGISTER_COUNT = 5
 
 
+def ensure_proxy_kernels(heavy: bool = False) -> None:
+    """保活代理内核 (mihomo + xray 双内核)。
+
+    代理内核与后端生命周期绑定：本函数在 daemon 启动、主循环每轮、注册批次前调用，
+    使 mihomo(Clash 内核) + xray(V2Ray 系内核) 随后端一同启动、崩溃自动重启。
+
+    轻量模式 (heavy=False)：仅检测端口，未监听则拉起。
+    完整模式 (heavy=True)：额外做出口连通性测试，失败则轮换节点/重启内核。
+    """
+    sys.path.insert(0, str(ROOT / "邮箱注册"))
+    os.environ["SUB_PROXY_FAST_START"] = "1"
+    # ── mihomo (Clash 内核) ──
+    try:
+        from subscription_proxy import get_manager as get_mihomo_manager
+        mgr = get_mihomo_manager()
+        if not mgr.is_running:
+            log.warning("[保活] mihomo 内核未运行，拉起")
+            ok, msg = mgr.start()
+            log.info("[保活] mihomo start: ok=%s %s", ok, msg)
+        elif heavy:
+            t = mgr.test_proxy()
+            if not t.get("ok"):
+                log.warning("[保活] mihomo 出口不通: %s，轮换节点", t.get("error"))
+                ok, msg = mgr.switch_to_next_node()
+                log.info("[保活] mihomo switch: ok=%s %s", ok, msg)
+                t2 = mgr.test_proxy()
+                if not t2.get("ok"):
+                    log.warning("[保活] mihomo 轮换后仍不通: %s，重启内核", t2.get("error"))
+                    mgr.stop()
+                    ok, msg = mgr.start()
+                    log.info("[保活] mihomo restart: ok=%s %s", ok, msg)
+    except Exception as e:
+        log.warning("[保活] mihomo 内核异常: %s", e)
+    # ── xray (V2Ray 系内核) ──
+    try:
+        from xray_proxy import get_xray_manager
+        xm = get_xray_manager()
+        ok, msg = xm.ensure_running()
+        if not ok:
+            log.warning("[保活] xray 内核拉起失败: %s", msg)
+        elif heavy:
+            t = xm.test_proxy()
+            if not t.get("ok"):
+                # xray 节点不通属配置层面问题，重启进程无效；仅记日志，节点选择由 _build_config 复用 mihomo 节点处理
+                log.warning("[保活] xray 出口不通: %s (节点问题，不重启进程)", t.get("error"))
+            else:
+                log.info("[保活] xray 出口正常: %s (%s)", t.get("ip"), t.get("country"))
+    except Exception as e:
+        log.warning("[保活] xray 内核异常: %s", e)
+
+
 def run(cmd: list[str], timeout: int | None = None, env: dict | None = None) -> int:
     log.info("RUN: %s", " ".join(cmd))
     p = subprocess.Popen(cmd, cwd=str(ROOT), env=env or os.environ.copy())
@@ -137,6 +188,8 @@ def post_register_fetch_rt() -> None:
 def register_batch() -> None:
     save_status({"phase": "registering", "phase_message": f"串行注册 {REGISTER_COUNT} 个 Outlook 账号"})
     ensure_xvfb()
+    # 注册前确保代理内核健康（双内核保活）
+    ensure_proxy_kernels(heavy=True)
     env = os.environ.copy()
     env["DISPLAY"] = DISPLAY_ID
     env["SUB_PROXY_FAST_START"] = "1"
@@ -182,6 +235,8 @@ def seconds_until_midnight() -> float:
 def main() -> int:
     log.info("Outlook daemon start: interval=4h count=5 serial forever")
     ensure_xvfb()
+    # 后端启动时拉起代理内核 (mihomo + xray)，与后端生命周期绑定
+    ensure_proxy_kernels(heavy=True)
     sync_credentials(push=True)
     next_register, run_now, reason = resolve_next_register_on_startup()
     log.info("schedule: %s next_register=%s run_immediately=%s", reason, next_register, run_now)
@@ -201,9 +256,13 @@ def main() -> int:
             "phase_message": "本轮完成，等待下一轮 4 小时",
             "next_register_at": next_register,
         })
+    loop_count = 0
     while True:
+        loop_count += 1
         now = time.time()
         try:
+            # 主循环保活代理内核：每轮轻量检测端口，每 10 轮 (约 5 分钟) 做出口验证
+            ensure_proxy_kernels(heavy=(loop_count % 10 == 0))
             if now >= next_push:
                 log.info("daily midnight credential push")
                 sync_credentials(push=True)

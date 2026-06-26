@@ -353,6 +353,62 @@ class RegistrationResult:
     auto_country: str = ""  # 网站根据代理IP自动选择的国家
 
 
+_FAILURE_DIR = Path(__file__).resolve().parents[1] / "runtime_outlook" / "failure_dumps"
+
+
+def _capture_failure(browser, error_code: str, account=None) -> str:
+    """失败时捕获页面上下文（截图+URL+HTML片段+可见文本），返回 dump 基名。"""
+    try:
+        _FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        base = f"{ts}_{error_code}_{secrets.token_hex(3)}"
+        info = {"error": error_code, "timestamp": ts}
+        try:
+            info["url"] = (browser.get_url() or browser.current_url() or "")[:500]
+        except Exception:
+            info["url"] = ""
+        try:
+            info["title"] = (browser.title() or "")[:200]
+        except Exception:
+            info["title"] = ""
+        try:
+            info["page_text"] = (browser.evaluate("document.body ? document.body.innerText : ''") or "")[:4000]
+        except Exception:
+            info["page_text"] = ""
+        try:
+            html = browser.evaluate("document.documentElement ? document.documentElement.outerHTML : ''") or ""
+            snippets = []
+            for kw in ["block", "suspended", "locked", "error", "verify", "unusual", "phone", "code", "aptcha", "restrict", "protect"]:
+                for m in re.finditer(kw, html, re.IGNORECASE):
+                    start = max(0, m.start() - 300)
+                    end = min(len(html), m.end() + 300)
+                    snippets.append(html[start:end])
+                    if len(snippets) >= 8:
+                        break
+                if len(snippets) >= 8:
+                    break
+            info["html_snippets"] = snippets
+        except Exception:
+            info["html_snippets"] = []
+        try:
+            sp = str(_FAILURE_DIR / f"{base}.png")
+            browser.screenshot(sp)
+            info["screenshot"] = f"{base}.png"
+        except Exception:
+            info["screenshot"] = ""
+        if account:
+            info["email"] = getattr(account, "email", "")
+            info["country"] = getattr(account, "country", "")
+        (_FAILURE_DIR / f"{base}.txt").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.warning("[FAIL_DUMP] %s -> %s.txt | url=%s | title=%s", error_code, base, info.get("url", "")[:100], info.get("title", "")[:60])
+        return base
+    except Exception as e:
+        logger.warning("[FAIL_DUMP] capture error: %s", e)
+        return ""
+
+
 def _random_account(domain: str = "outlook.com", provider: str = "outlook") -> OutlookAccount:
     """Generate a random Outlook account."""
     first_names = [
@@ -3473,7 +3529,7 @@ def register_outlook_account(
                 _crash_count += 1
                 if _crash_count >= 3:
                     logger.error("[CDP_REG] Chrome 进程已崩溃（连续%d次检测失败），退出状态机", _crash_count)
-                    result.error = "browser_crashed"; break
+                    _df = _capture_failure(browser, "browser_crashed", account); result.error = "browser_crashed" + (f" [dump:{_df}]" if _df else ""); break
                 else:
                     logger.warning("[CDP_REG] get_url 异常（第%d次），可能是临时连接问题，重试...", _crash_count)
                     time.sleep(2); continue
@@ -3490,6 +3546,8 @@ def register_outlook_account(
                 logger.info("[CDP_REG] Registration successful: %s", account.email)
                 if _check_pause_or_stop("extract_rt"): result.error = "stopped"; return result
                 if extract_rt and browser:
+                    _rt_proxy = proxy_info.url if proxy_info and proxy_info.has_auth else (proxy_url if proxy_url else "")
+                    # ── 同浏览器尝试获取 RT（失败则留给 launcher 层用新浏览器账号密码补）──
                     try:
                         # 传入代理 URL，用于 token 交换请求（带认证的完整代理 URL）
                         _rt_proxy = proxy_info.url if proxy_info and proxy_info.has_auth else (proxy_url if proxy_url else "")
@@ -3502,16 +3560,18 @@ def register_outlook_account(
                         if rt: logger.info("[CDP_REG] RT 获取成功: %s...", rt[:30])
                         else: logger.warning("[CDP_REG] RT 获取失败（注册已成功）")
                     except Exception as rt_exc:
-                        logger.warning("[CDP_REG] RT 获取异常: %s", rt_exc)
+                        logger.warning("[CDP_REG] 同浏览器 RT 异常: %s", rt_exc)
                 break
 
             if page_state == "blocked":
-                result.error = "account_blocked"; break
+                _df = _capture_failure(browser, "account_blocked", account)
+                result.error = "account_blocked" + (f" [dump:{_df}]" if _df else "")
+                break
             if page_state == "microsoft_problem":
                 _ms_error_count += 1
                 if _ms_error_count >= 5:
                     logger.error("[CDP_REG] microsoft_problem 页面重试 %d 次仍失败,放弃", _ms_error_count)
-                    result.error = "microsoft_problem_page"; break
+                    _df = _capture_failure(browser, "microsoft_problem_page", account); result.error = "microsoft_problem_page" + (f" [dump:{_df}]" if _df else ""); break
                 logger.warning("[CDP_REG] microsoft_problem 页面 (第%d次), 等待5秒后刷新重试...", _ms_error_count)
                 time.sleep(5)
                 # 尝试刷新页面重新加载
@@ -3538,7 +3598,7 @@ def register_outlook_account(
                 if _fill_username(browser, account):
                     _steps_done.add("fill_username")
                 else:
-                    result.error = "username_fill_failed"; break
+                    _df = _capture_failure(browser, "username_fill_failed", account); result.error = "username_fill_failed" + (f" [dump:{_df}]" if _df else ""); break
                 continue
 
             # ── 填写密码 ──
@@ -3547,7 +3607,7 @@ def register_outlook_account(
                 if _fill_password(browser, account.password):
                     _steps_done.add("fill_password")
                 else:
-                    result.error = "password_fill_failed"; break
+                    _df = _capture_failure(browser, "password_fill_failed", account); result.error = "password_fill_failed" + (f" [dump:{_df}]" if _df else ""); break
                 continue
 
             # ── 填写个人信息 ──
@@ -3609,6 +3669,8 @@ def register_outlook_account(
                     result.success = True
                     logger.info("[CDP_REG] Registration successful: %s", account.email)
                     if extract_rt and browser:
+                        _rt_proxy = proxy_info.url if proxy_info and proxy_info.has_auth else (proxy_url if proxy_url else "")
+                        # ── 同浏览器尝试获取 RT（失败则留给 launcher 层用新浏览器账号密码补）──
                         try:
                             _rt_proxy = proxy_info.url if proxy_info and proxy_info.has_auth else (proxy_url if proxy_url else "")
                             # 优先使用 Device Code 流程（更可靠，不需要 localhost 回调）
@@ -3619,12 +3681,14 @@ def register_outlook_account(
                             result.refresh_token = rt
                             if rt: logger.info("[CDP_REG] RT 获取成功: %s...", rt[:30])
                         except Exception as rt_exc:
-                            logger.warning("[CDP_REG] RT 获取异常: %s", rt_exc)
+                            logger.warning("[CDP_REG] 同浏览器 RT 异常: %s", rt_exc)
                     break
                 elif final_state == "microsoft_problem":
-                    result.error = "microsoft_problem_page"; break
+                    _df = _capture_failure(browser, "microsoft_problem_page", account); result.error = "microsoft_problem_page" + (f" [dump:{_df}]" if _df else ""); break
                 elif final_state == "blocked":
-                    result.error = "account_blocked"; break
+                    _df = _capture_failure(browser, "account_blocked", account)
+                    result.error = "account_blocked" + (f" [dump:{_df}]" if _df else "")
+                    break
                 elif final_state in ("fill_username", "fill_password", "fill_profile"):
                     # _handle_post_challenge 返回了需要填写的状态，继续主循环处理
                     logger.info("[CDP_REG] post_challenge 返回 %s，继续主循环处理", final_state)
@@ -3653,6 +3717,31 @@ def register_outlook_account(
                 time.sleep(3)
                 continue
 
+            # ── 未知状态 → 先快速检测是否已到达成功页面（避免已成功账号被标记 max_iterations）──
+            try:
+                _unk_url = browser.get_url().lower()
+                logger.info("[CDP_REG] unknown 快速检测 url=%s", _unk_url[:120])
+                if any(d in _unk_url for d in ["outlook.live.com", "account.microsoft.com", "outlook.com/", "login.live.com/oauth", "oauth20_authorize"]):
+                    logger.info("[CDP_REG] unknown 状态检测到成功 URL: %s → 标记注册成功", _unk_url[:80])
+                    result.success = True
+                    result.final_state = "account_home"
+                    result.final_url = _unk_url
+                    if extract_rt and browser:
+                        _rt_proxy = proxy_info.url if proxy_info and proxy_info.has_auth else (proxy_url if proxy_url else "")
+                        # ── 同浏览器尝试获取 RT（失败则留给 launcher 层用新浏览器账号密码补）──
+                        try:
+                            _rt = _extract_refresh_token(browser, account.email, account.client_id or "14d82eec-204b-4c2f-b7e8-296a70dab67e", password=account.password, proxy_url=_rt_proxy)
+                            if _rt:
+                                result.refresh_token = _rt
+                                logger.info("[CDP_REG] 同浏览器 RT 成功: %s...", _rt[:30])
+                            else:
+                                logger.warning("[CDP_REG] 同浏览器 RT 失败，留给 launcher 新浏览器补")
+                        except Exception as rt_exc:
+                            logger.warning("[CDP_REG] 同浏览器 RT 异常: %s", rt_exc)
+                    break
+            except Exception:
+                pass
+
             # ── 未知状态 → 等待页面加载，尝试恢复 ──
             logger.info("[CDP_REG] 未知页面状态 '%s'，等待3秒...", page_state)
             time.sleep(3)
@@ -3667,7 +3756,7 @@ def register_outlook_account(
                 else:
                     logger.info("[CDP_REG] 连续 unknown %d 次，但 body 为空(长度=%d)，跳过点击", _iter, len(body_now))
         else:
-            result.error = "max_iterations_reached"
+            _df = _capture_failure(browser, "max_iterations_reached", account); result.error = "max_iterations_reached" + (f" [dump:{_df}]" if _df else "")
             logger.error("[CDP_REG] 状态机循环超过最大次数")
 
     except Exception as e:

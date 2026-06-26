@@ -1,812 +1,516 @@
-# Outlook 邮箱自动注册 — 完整部署与运维实战指南
+# Outlook 自动注册系统 — 全新服务器部署指南
 
-> **本文档是所有实战部署、运行、排障经验的结晶。部署新节点或排障时优先查阅此文档。**
-
----
-
-## 目录
-
-1. [系统架构总览](#一系统架构总览)
-2. [从零部署新节点](#二从零部署新节点)
-3. [前端面板与内网穿透](#三前端面板与内网穿透)
-4. [凭证管理与同步推送](#四凭证管理与同步推送)
-5. [代理与网络配置](#五代理与网络配置)
-6. [浏览器实例管理](#六浏览器实例管理)
-7. [运维经验与踩坑总结](#七运维经验与踩坑总结)
-8. [监控、告警与自动修复](#八监控告警与自动修复)
-9. [多节点协同](#九多节点协同)
-10. [FAQ 快速排障表](#十faq-快速排障表)
+> **给 AI 的说明**：将本文件完整阅读后，按照步骤执行部署。适配 Zo 服务器、Gcore/普通 VPS、本地开发机三种环境。
 
 ---
 
-## 一、系统架构总览
+## 一、系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Zo User Service Supervisor                │
-│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
-│  │ Xvfb :98     │  │ WARP/usque proxy │  │ mihomo proxy     │   │
-│  │ (虚拟显示)    │  │ (SOCKS5 :1080)   │  │ (HTTP :7890)     │   │
-│  └──────┬───────┘  └────────┬─────────┘  └────────┬─────────┘   │
-│         │                   │                      │             │
-│  ┌──────▼───────────────────▼──────────────────────▼─────────┐   │
-│  │              outlook_daemon_hub_primary.sh (Hub)           │   │
-│  │  1. 启动 Xvfb    2. 启动代理    3. 启动前端面板            │   │
-│  │  4. 启动 ngrok   5. exec outlook_daemon.py                 │   │
-│  └──────────────────────┬────────────────────────────────────┘   │
-│                         │                                        │
-│  ┌──────────────────────▼────────────────────────────────────┐   │
-│  │                outlook_daemon.py (核心守护进程)             │   │
-│  │  ┌─────────────┐ ┌──────────────┐ ┌────────────────────┐  │   │
-│  │  │ 注册循环     │ │ RT 提取       │ │ 凭证同步 (cron)   │  │   │
-│  │  │ (4h/5账号)  │ │ (device code) │ │ (每天 00:00 push) │  │   │
-│  │  └─────────────┘ └──────────────┘ └────────────────────┘  │   │
-│  └───────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐   │
-│  │        outlook_dashboard_server.py (前端面板 :8765)        │   │
-│  │  Web UI + REST API + 状态展示 + 手动操作按钮               │   │
-│  └──────────────────────────┬────────────────────────────────┘   │
-│                             │                                    │
-│  ┌──────────────────────────▼────────────────────────────────┐   │
-│  │        Zo Space Route (前端反向代理)                        │   │
-│  │  /outlook → iframe     /api/outlook/* → proxy :8765       │   │
-│  │  域名: https://ts8.zocomputer.io                           │   │
-│  └───────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 核心组件
-
-| 组件 | 文件 | 作用 |
-|------|------|------|
-| **守护进程** | `outlook_daemon.py` | 每 4h 注册 5 个账号 + 获取 RT + 定时同步凭证 |
-| **Hub 脚本** | `outlook_daemon_hub_primary.sh` | 启动所有依赖服务 + exec 守护进程 |
-| **前端面板** | `outlook_dashboard_server.py` | Web UI（HTML/JS/CSS 单页面） + REST API |
-| **注册核心** | `邮箱注册/cdp_outlook.py` | CDP 协议操控 Chrome 完成 Outlook 注册 |
-| **RT 提取** | `post_register_fetch_rt.py` | 注册后通过 device code flow 获取 refresh_token |
-| **凭证同步** | `sync_credentials.py` | 合并本地凭证 → git fetch+rebase → push 到私有仓库 |
-| **浏览器清理** | `cleanup.py` | 清理幽灵 Chrome 进程防止 OOM |
-
----
-
-## 二、从零部署新节点
-
-### 2.1 前置要求
-
-| 要求 | 最低配置 | 推荐配置 |
-|------|----------|----------|
-| OS | Linux (Ubuntu 20+) | Debian 12 / Ubuntu 22 |
-| RAM | 2 GB | 4 GB+ |
-| CPU | 1 core | 2 cores |
-| Disk | 10 GB | 20 GB |
-| Python | 3.10+ | 3.11+ |
-| Chrome/Chromium | 系统安装 | `chromium` 包 |
-| Xvfb | `xvfb` 包 | 必须 |
-
-### 2.2 安装步骤
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/xingluoyuankong/outlook-auto-register.git Email-Register
-cd Email-Register
-
-# 2. 安装 Python 依赖
-pip install -r requirements.txt
-pip install playwright
-playwright install chromium
-playwright install-deps chromium
-
-# 3. 安装系统依赖
-apt-get install -y xvfb chromium-browser git
-
-# 4. 初始化 runtime 目录
-mkdir -p runtime_outlook/logs runtime_outlook/rt_tokens
-mkdir -p 云端注册邮箱/三凭证 云端注册邮箱/四凭证
-
-# 5. 配置 Git SSH (用于凭证推送)
-# 将 SSH 私钥放到 ~/.ssh/ 并配置 config
-cat > ~/.ssh/config <<'EOF'
-Host github.com-cloud-register
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/id_ed25519_cloud_register
-    StrictHostKeyChecking no
-EOF
-
-# 6. 初始化凭证仓库
-cd 云端注册邮箱
-git init
-git remote add origin git@github.com:<你的私有凭证仓库>.git
-git fetch origin
-git branch --track main origin/main 2>/dev/null || git checkout -b main
-cd ..
-
-# 7. 配置环境变量
-export DISPLAY=:98
-export OUTLOOK_DASHBOARD_PORT=8765
-# (可选) 代理配置
-export HTTP_PROXY=http://127.0.0.1:7890
-export HTTPS_PROXY=http://127.0.0.1:7890
-```
-
-### 2.3 Zo 环境部署
-
-如果在 Zo 工作空间中部署，使用 User Service 注册：
-
-```python
-# 注册 Hub 脚本为 process 类型服务
-register_user_service(
-    label="outlook-register-daemon",
-    mode="process",
-    entrypoint="bash /home/workspace/Email-Register/outlook_daemon_hub_primary.sh",
-    workdir="/home/workspace/Email-Register",
-    env_vars={
-        "DISPLAY": ":98",
-        "OUTLOOK_DASHBOARD_PORT": "8765",
-    }
-)
-```
-
-### 2.4 验证部署
-
-```bash
-# 检查进程
-ps aux | grep -E "(outlook_daemon|dashboard|Xvfb)" | grep -v grep
-
-# 检查前端
-curl -s http://localhost:8765/api/status | python3 -m json.tool
-
-# 手动触发一轮注册
-curl -s http://localhost:8765/api/trigger_round -X POST | python3 -m json.tool
+┌─────────────────────────────────────────────────────┐
+│  Xvfb :98 (虚拟显示, Chrome 必须 non-headless)       │
+│    └── Chrome 浏览器 (CDP 协议)                       │
+│                                                       │
+│  Xray-core 内核 (:28889 socks / :28890 http)         │
+│    └── 直接抓订阅 → 解析 vless节点(reality/tls/ws)    │
+│    └── 按节点轮循, blocked自动拉黑4h                  │
+│                                                       │
+│  mihomo 内核 (:28888 mixed) — 兜底                    │
+│    └── clash格式节点 (全部类型)                       │
+│                                                       │
+│  outlook_daemon.py (守护进程)                         │
+│    ├── 保活: Xvfb + xray + mihomo + dashboard         │
+│    ├── 每 4 小时串行注册 5 个 Outlook 账号            │
+│    ├── 注册后新浏览器获取 refresh_token               │
+│    └── 每天 00:00 推送凭证到 GitHub 私有仓库          │
+│                                                       │
+│  outlook_dashboard_server.py (:8765)                  │
+│    └── 前端面板: 状态 + 手动操作 + 双内核控制          │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 三、前端面板与内网穿透
-
-### 3.1 前端面板架构
-
-```
-用户浏览器
-    │
-    ▼
-┌─────────────────────────────┐
-│  Zo Space Route (/outlook)  │  ← HTTPS, 公网可达
-│  ┌────────────────────────┐ │
-│  │ iframe src=/api/outlook│ │
-│  └───────────┬────────────┘ │
-└──────────────┼──────────────┘
-               ▼
-┌─────────────────────────────┐
-│  /api/outlook/:path{.*}     │  ← API Route (Hono)
-│  反向代理 → localhost:8765  │
-└──────────────┬──────────────┘
-               ▼
-┌─────────────────────────────┐
-│  dashboard_server.py :8765  │  ← Python HTTP Server
-│  纯 HTML/JS/CSS 单页面      │
-│  REST API (JSON)            │
-└─────────────────────────────┘
-```
-
-### 3.2 Zo Space Route 配置
-
-**页面路由** `/outlook`:
-```tsx
-export default function OutlookDashboard() {
-  return (
-    <div style={{ width: "100%", height: "100vh", overflow: "hidden" }}>
-      <iframe src="/api/outlook/" style={{ width: "100%", height: "100%", border: "none" }} />
-    </div>
-  );
-}
-```
-
-**API 路由** `/api/outlook` 和 `/api/outlook/:path{.*}`:
-```typescript
-// 统一反向代理到 localhost:8765
-// 支持 GET/POST/PUT/DELETE 所有方法
-// 支持 JSON 和 multipart/form-data body
-// 转发所有 headers（除 Host/Connection）
-```
-
-### 3.3 内网穿透方案对比
-
-| 方案 | 固定域名 | 免费 | 稳定性 | 推荐度 |
-|------|----------|------|--------|--------|
-| **Zo Space Route** | ✅ 固定 | ✅ | ⭐⭐⭐⭐⭐ | 🏆 首选 |
-| **ngrok 付费版** | ✅ 固定 | ❌ | ⭐⭐⭐⭐ | 备选 |
-| **ngrok 免费版** | ❌ 每次变 | ✅ | ⭐⭐⭐ | 临时用 |
-| **Cloudflare Tunnel** | ✅ 固定 | ✅ | ⭐⭐⭐⭐ | 独立部署时推荐 |
-| **SSH 反向隧道** | ❌ | ✅ | ⭐⭐ | 应急 |
-
-### 3.4 独立部署时的 Cloudflare Tunnel 方案
-
-```bash
-# 安装 cloudflared
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | \
-  sudo tee /etc/apt/sources.list.d/cloudflared.list
-sudo apt update && sudo apt install cloudflared
-
-# 登录
-cloudflared tunnel login
-
-# 创建隧道
-cloudflared tunnel create outlook-register
-
-# 配置
-cat > ~/.cloudflared/config.yml <<'EOF'
-tunnel: outlook-register
-credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
-ingress:
-  - hostname: outlook.yourdomain.com
-    service: http://localhost:8765
-  - service: http_status:404
-EOF
-
-# DNS
-cloudflared tunnel route dns outlook-register outlook.yourdomain.com
-
-# 运行
-cloudflared tunnel run outlook-register
-```
-
-### 3.5 安全注意事项
-
-- **Zo Space Route** 默认有 Zo 认证保护
-- **Cloudflare Tunnel** 建议配合 Cloudflare Access (Zero Trust) 添加认证
-- **ngrok** 建议使用 `--basic-auth` 参数
-- 面板 API 的敏感操作（注册、同步）已有日志记录
-- **绝对不要**将面板暴露在公网且无认证
-
----
-
-## 四、凭证管理与同步推送
-
-### 4.1 凭证类型
-
-| 类型 | 文件名格式 | 内容格式 | 说明 |
-|------|-----------|----------|------|
-| **三凭证** | `email@outlook.com.txt` | `email----password----client_id` | 注册即有 |
-| **四凭证** | `email@outlook.com.txt` | `email----password----client_id----refresh_token` | RT 获取成功后 |
-
-### 4.2 存储结构
-
-```
-云端注册邮箱/
-├── 三凭证/
-│   ├── 2026-06-07/
-│   │   ├── user1@outlook.com.txt
-│   │   └── user2@outlook.com.txt
-│   ├── 2026-06-08/
-│   └── ...
-├── 四凭证/
-│   ├── 2026-06-06/
-│   ├── 2026-06-07/
-│   └── ...
-├── all_success.jsonl          ← 唯一真实来源
-├── README.md
-└── .git/
-```
-
-### 4.3 sync_credentials.py 核心逻辑
-
-```
-每次执行 sync_credentials.py --push:
-
-1. 扫描 sources:
-   ├── runtime_outlook/results.jsonl (主 daemon 注册结果)
-   ├── 自动化定时注册Outlook邮箱/runtime_outlook/results.jsonl (备用)
-   ├── runtime_outlook/rt_tokens/ (RT token 文件)
-   └── EXTRA_CRED_DIRS (额外凭证目录, 如 /home/workspace/6/)
-
-2. 合并规则:
-   ├── 新邮箱 + 有 RT → 只写四凭证
-   ├── 新邮箱 + 无 RT → 写三凭证 (除非已有四凭证)
-   ├── 已有 + 三→四升级 → 写四凭证 + 删除三凭证
-   ├── 已有 + 三→三 → 跳过 (不覆盖)
-   └── 已有 + 四→四 → 跳过 (不覆盖)
-
-3. Git 同步:
-   ├── _ensure_clean_git_state() → 清理卡住的 rebase/merge
-   ├── _normalize_at_filenames() → _at_ → @ 文件名修复
-   ├── git add 三凭证/ 四凭证/ all_success.jsonl
-   ├── git commit
-   ├── git fetch origin
-   ├── git rebase origin/main (失败则 merge -X theirs)
-   └── git push (最多重试 3 次)
-
-4. 成功后:
-   └── _archive_old_local_credentials() → 移到 已推送凭证/
-```
-
-### 4.4 ⚠️ 凭证推送踩坑经验
-
-**坑 1: Git Rebase 冲突导致推送永久卡死**
-
-```
-症状: sync_credentials.py 每次执行都 exit=1
-原因: 一次 rebase 冲突未解决，repo 卡在 "interactive rebase in progress"
-解决: 
-  git rebase --abort          # 或 git rebase --continue
-  # 然后手动解决冲突
-改进: _ensure_clean_git_state() 会在每次推送前自动检测并 abort 卡住的状态
-```
-
-**坑 2: `@` vs `_at_` 文件名不一致**
-
-```
-症状: 同一个邮箱出现两个文件 (user@outlook.com.txt 和 user_at_outlook.com.txt)
-原因: 不同节点/工具使用了不同的文件名格式
-解决: _normalize_at_filenames() 自动将 _at_ 重命名为 @
-规则: 统一使用 @ 作为文件名中的分隔符
-```
-
-**坑 3: push rejected (non-fast-forward)**
-
-```
-症状: git push 被拒绝
-原因: 远程有其他节点推送的新 commit
-解决: 脚本已内置 3 次重试:
-  1. fetch → rebase → push
-  2. 如果 rebase 失败 → merge -X theirs → push
-  3. 如果还失败 → 放弃本次推送，等下次 cron
-```
-
-**坑 4: 四凭证覆盖三凭证的反向操作**
-
-```
-规则: 
-  ✅ 四凭证可以覆盖三凭证 (升级)
-  ❌ 三凭证不能覆盖四凭证 (降级)
-  ❌ 四凭证不能覆盖四凭证 (已有 RT 不覆盖)
-实现: rt_status dict 追踪每个邮箱的 RT 状态
-```
-
----
-
-## 五、代理与网络配置
-
-### 5.1 代理架构
-
-```
-注册 Chrome 浏览器
-    │
-    ├── 优先: WARP (usque SOCKS5 :1080)
-    │   └── Cloudflare WARP 出口，IP 信誉好
-    │
-    ├── 备选: mihomo (HTTP :7890)
-    │   └── 订阅代理，支持多节点切换
-    │
-    └── 兜底: 直连 (不推荐，容易被封)
-```
-
-### 5.2 WARP 代理 (usque)
-
-```bash
-# 安装
-apt install -y ca-certificates curl
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://repo.arano.id/apt/gpg.key | gpg --dearmor > /etc/apt/keyrings/arano-id.gpg
-echo "deb [signed-by=/etc/apt/keyrings/arano-id.gpg] https://repo.arano.id/apt /" > /etc/apt/sources.list.d/arano-id.list
-apt update && apt install usque
-
-# 配置
-usque generate --output /etc/usque/config.json
-
-# 启动
-usque socks -b 0.0.0.0 -p 1080 -c /etc/usque/config.json
-
-# 验证
-curl -x socks5h://127.0.0.1:1080 https://ipinfo.io
-```
-
-### 5.3 Mihomo 代理
-
-```bash
-# 配置文件路径
-/etc/mihomo/config.yaml
-
-# 订阅更新
-python3 邮箱注册/subscription_proxy.py --update
-
-# 启动
-mihomo -d /etc/mihomo
-
-# 验证
-curl -x http://127.0.0.1:7890 https://ipinfo.io
-```
-
-### 5.4 代理选择策略
-
-```python
-# outlook_daemon.py 中的代理选择逻辑:
-def get_proxy():
-    # 1. 优先 WARP (IP 信誉最好)
-    if warp_available():
-        return "socks5://127.0.0.1:1080"
-    # 2. 备选 mihomo
-    if mihomo_available():
-        return "http://127.0.0.1:7890"
-    # 3. 兜底直连
-    return None
-```
-
-### 5.5 ⚠️ 代理踩坑经验
-
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| IP 被封 | 同一 IP 注册过多 | 换代理 / 用 WARP (自动换 IP) |
-| 注册页面加载超时 | 代理延迟高 | 增加超时时间 / 换节点 |
-| "Sorry, something went wrong" | IP 信誉差 | 用 WARP 或高质量代理 |
-| DNS 解析失败 | SOCKS5 DNS 泄漏 | 使用 `socks5h://` (远程 DNS) |
-| 代理订阅过期 | 未自动更新 | 配置 subscription_proxy.py cron |
-
----
-
-## 六、浏览器实例管理
-
-### 6.1 浏览器生命周期
-
-```
-启动 Chrome (--remote-debugging-port)
-    │
-    ├── CDP 连接
-    ├── 注册流程 (navigate → fill → submit → verify)
-    ├── 注册完成
-    │
-    ├── RT 提取 (启动新 Chromium via Playwright)
-    │   ├── 登录新注册邮箱
-    │   ├── 获取 device code
-    │   └── 提取 refresh_token
-    │
-    └── 清理
-        ├── kill_orphan_chrome_processes()
-        ├── CDPBrowser.close() → os.killpg()
-        └── pkill 兜底
-```
-
-### 6.2 ⚠️ 幽灵浏览器问题 (最常见的 OOM 原因!)
-
-```
-症状: 
-  - 内存逐渐升高直到 OOM
-  - "Killed" 出现在日志中
-  - ps aux 显示大量 chrome/chromium 进程
-
-原因:
-  - 注册异常中断 (超时/OOM/外部 kill)
-  - Chrome 崩溃导致 _process 引用丢失
-  - Playwright 启动的浏览器未被回收
-  - 子进程存活但主进程已退出
-
-解决:
-  - daemon 每轮结束自动调用 kill_orphan_chrome_processes()
-  - 不要手动 pkill -9 chrome (会误杀 Zo agent-browser!)
-  - 使用 cleanup.py 的安全清理函数
-
-安全检查:
-  python3 -c "from 邮箱注册.cdp_outlook import kill_orphan_chrome_processes; kill_orphan_chrome_processes()"
-```
-
-### 6.3 Xvfb 虚拟显示
-
-```bash
-# 启动
-Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &
-
-# 环境变量
-export DISPLAY=:98
-
-# 验证
-xdpyinfo -display :98 | head -5
-
-# 注意:
-# - 必须 -ac (disable access control)
-# - 必须 -nolisten tcp (安全)
-# - 分辨率 1366x768 模拟真实桌面
-# - 如果 Xvfb 挂了，所有 Chrome 都会失败
-```
-
----
-
-## 七、运维经验与踩坑总结
-
-### 7.1 注册成功率优化
-
-| 优化项 | 效果 | 实现方式 |
-|--------|------|----------|
-| WARP 代理 | 成功率提升 30%+ | IP 信誉好，不被封 |
-| 随机 User-Agent | 减少指纹检测 | 每次启动随机生成 |
-| 随机延迟 | 减少行为检测 | 每步操作间随机 1-3s |
-| 真实姓名生成 | 减少审核拒绝 | 使用 faker 生成真实姓名 |
-| 密码复杂度 | 满足微软要求 | 大小写+数字+特殊字符, 12位+ |
-| 清理 cookies | 避免关联 | 每次新 user-data-dir |
-
-### 7.2 RT (Refresh Token) 获取经验
-
-```
-成功率: 约 93% (30/32)
-
-获取方式: Device Code Flow
-  1. POST /common/oauth2/v2.0/devicecode → 获取 device_code
-  2. 用 Playwright Chromium 打开登录页面
-  3. 自动填入邮箱 + 密码
-  4. 输入 device code
-  5. 等待授权完成
-  6. POST /common/oauth2/v2.0/token → 获取 refresh_token
-
-常见问题:
-  - "Need too many tries" → 等 30 分钟再试
-  - "Account locked" → 等 24 小时
-  - 验证码出现 → 当前无自动解决方案，标记为失败
-  - Playwright Chromium 启动慢 → 增加超时时间到 60s
-```
-
-### 7.3 Daemon 重启机制
-
-```python
-# Zo User Service Supervisor 自动重启
-# 进程退出后 supervisor 会在几秒内重启
-# 48 次重启 = 13 天内平均每天 3-4 次
-
-常见重启原因:
-  1. OOM (幽灵浏览器堆积) → 定期清理
-  2. 代理断开 → 自动重连后恢复
-  3. Chrome 崩溃 → 自动重启后恢复
-  4. Python 异常 → 已加 try-except 保护
-  5. Git 推送失败 → 不影响注册循环
-```
-
-### 7.4 关键经验总结
-
-```
-1. 【绝对不要手动 kill daemon】
-   → 让 supervisor 管理，手动 kill 可能导致状态不一致
-
-2. 【绝对不要用 pkill -9 chrome】
-   → 会杀掉 Zo 的 agent-browser，导致整个工作空间不可用
-   → 用 kill_orphan_chrome_processes() 安全清理
-
-3. 【Xvfb 必须先于 Chrome 启动】
-   → Chrome 没有 DISPLAY 会直接退出
-   → Hub 脚本保证了启动顺序
-
-4. 【runtime_outlook/ 目录不能清理】
-   → 包含 logs、results.jsonl、rt_tokens
-   → 这些是 daemon 的状态文件，清理后注册统计会丢失
-
-5. 【凭证仓库必须用 rebase 而非 merge】
-   → 多节点推送时 merge 会产生大量冲突
-   → rebase + -X theirs 策略最安全
-
-6. 【文件名统一用 @ 不用 _at_】
-   → 不同工具生成的文件名格式不一致会导致重复
-   → _normalize_at_filenames() 自动修复
-
-7. 【代理质量决定注册成功率】
-   → 免费代理成功率 < 30%
-   → WARP 代理成功率 > 60%
-   → 住宅代理成功率 > 80%
-
-8. 【每轮注册后必须清理浏览器】
-   → 4GB 内存的节点最多容忍 3-5 个幽灵 Chrome
-   → daemon 内置清理，但手动触发注册时要手动清理
-
-9. 【同步推送失败不影响注册】
-   → 凭证先写到本地，下次 cron 再推
-   → 但如果 git 卡在 rebase，所有后续推送都会失败！
-   → _ensure_clean_git_state() 解决了这个问题
-
-10. 【前端面板不影响注册】
-    → 面板挂了只影响监控和手动操作
-    → daemon 是完全独立的进程
-```
-
----
-
-## 八、监控、告警与自动修复
-
-### 8.1 健康检查
-
-```bash
-# 1. 检查所有进程
-ps aux | grep -E "(outlook_daemon|dashboard|Xvfb|usque|mihomo)" | grep -v grep
-
-# 2. 检查前端可达
-curl -s http://localhost:8765/api/status | python3 -m json.tool
-
-# 3. 检查 daemon 状态
-curl -s http://localhost:8765/api/status | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print(f'阶段: {d[\"phase\"]} - {d[\"phase_message\"]}')
-print(f'总注册: {d[\"total_registrations\"]} | 今日: {d[\"today_registrations\"]}')
-print(f'运行时长: {d[\"total_runtime\"]} | 重启次数: {d[\"daemon_restarts\"]}')
-"
-
-# 4. 检查 git 仓库状态
-cd 云端注册邮箱 && git status && git log --oneline -3
-
-# 5. 检查幽灵浏览器
-ps aux | grep -c "[c]hrom"  # 应该 < 10
-```
-
-### 8.2 告警条件
-
-| 指标 | 告警阈值 | 动作 |
-|------|----------|------|
-| 连续失败 | ≥ 3 轮 | 检查代理 + 浏览器 |
-| 幽灵 Chrome | ≥ 10 进程 | 执行清理 |
-| 内存使用 | ≥ 80% | 清理浏览器 + 检查泄漏 |
-| Git push 失败 | 连续 2 天 | 检查 SSH + 仓库冲突 |
-| Daemon 重启 | ≥ 5 次/小时 | 检查 OOM / 异常日志 |
-| 面板不可达 | > 5 分钟 | 重启面板服务 |
-
-### 8.3 自动修复脚本
+## 二、环境检测（部署前必须执行）
 
 ```bash
 #!/bin/bash
-# auto_fix.sh - 自动检测并修复常见问题
+# 检测服务器类型
+echo "=== 1. 操作系统 ==="
+cat /etc/os-release | grep -E "^ID=|^VERSION="
 
-# 1. 如果 Xvfb 不在运行
-if ! pgrep -x Xvfb > /dev/null; then
-    Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &
-    sleep 2
-fi
+echo "=== 2. 当前用户 ==="
+whoami
+id -u  # 0=root, 非0需要sudo
 
-# 2. 如果幽灵浏览器过多 (>15)
-CHROME_COUNT=$(ps aux | grep -c "[c]hrom")
-if [ "$CHROME_COUNT" -gt 15 ]; then
-    python3 -c "from 邮箱注册.cdp_outlook import kill_orphan_chrome_processes; kill_orphan_chrome_processes()"
-fi
+echo "=== 3. 内存 ==="
+free -h | grep Mem
 
-# 3. 如果 git 仓库卡住
-cd 云端注册邮箱
-if git status 2>&1 | grep -q "rebase in progress\|merge in progress"; then
-    git rebase --abort 2>/dev/null
-    git merge --abort 2>/dev/null
-fi
-cd ..
+echo "=== 4. 磁盘 ==="
+df -h / | tail -1
 
-# 4. 如果内存不足 (<500MB free)
-FREE_MEM=$(free -m | awk '/Mem:/ {print $7}')
-if [ "$FREE_MEM" -lt 500 ]; then
-    python3 cleanup.py  # 紧急清理
+echo "=== 5. 架构 ==="
+uname -m  # x86_64 / aarch64
+
+echo "=== 6. Python ==="
+python3 --version 2>/dev/null || echo "未安装"
+python3 -m venv --help >/dev/null 2>&1 && echo "venv 可用" || echo "venv 缺失(需安装 python3-venv)"
+
+echo "=== 7. 部署目标判断 ==="
+if [[ -f /etc/zo/supervisord-user.conf ]] || grep -q "zocomputer" /etc/hostname 2>/dev/null; then
+  echo "→ Zo 服务器 (用 register_user_service 保活)"
+elif [[ "$(whoami)" == "ubuntu" ]]; then
+  echo "→ Gcore/Ubuntu VPS (用 systemd 保活)"
+else
+  echo "→ 通用 VPS (用 systemd 保活)"
 fi
 ```
 
 ---
 
-## 九、多节点协同
+## 三、路径适配（致命，必须正确）
 
-### 9.1 节点架构
+不同服务器项目路径不同，**所有脚本已改为动态路径**，但部署时仍需确认：
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  主节点 zo   │     │  zo2 节点   │     │  gcore 节点 │
-│  xzxyuan    │     │  user7fuda2 │     │  reedemma   │
-│             │     │             │     │             │
-│  daemon     │     │  daemon     │     │  daemon     │
-│  dashboard  │     │  dashboard  │     │  dashboard  │
-│  sync+push  │     │  只注册     │     │  只注册     │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       └───────────────────┼───────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │ GitHub 私有  │
-                    │ 凭证仓库     │
-                    └─────────────┘
+| 服务器类型 | 项目路径 | Python venv | 用户 |
+|-----------|----------|-------------|------|
+| Zo 服务器 | `/home/workspace/Email-Register` | `/home/workspace/email-register-venv` | root |
+| Gcore/Ubuntu VPS | `/home/ubuntu/Email-Register` | `/home/ubuntu/email-register-venv` | ubuntu |
+| 通用 VPS | `~/Email-Register` | `~/email-register-venv` | 当前用户 |
+
+**检查代码中是否有残留的硬编码路径**：
+```bash
+cd $PROJECT_DIR
+grep -rn "/home/workspace" 邮箱注册/*.py
+# 如果有输出，必须替换为动态路径:
+#   Path(__file__).resolve().parents[1]  (项目根目录)
+#   Path.home()  (用户家目录)
 ```
 
-### 9.2 分工
+---
 
-| 角色 | 节点 | 职责 |
+## 四、逐步部署
+
+### 4.1 安装系统依赖
+
+```bash
+# 检测是否需要 sudo
+SUDO=""
+[[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
+
+$SUDO apt-get update -qq
+
+# 基础依赖
+$SUDO apt-get install -y -qq \
+  python3 python3-pip python3-venv \
+  git curl wget xvfb \
+  chromium chromium-driver \
+  libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 \
+  libgbm1 libxshmfence1 libxcomposite1 \
+  libxrandr2 libxdamage1 libpango-1.0-0 libcairo2 \
+  libatspi2.0-0 libgtk-3-0 libx11-xcb1
+
+# Google Chrome (优先，兼容性更好)
+if ! command -v google-chrome-stable &>/dev/null; then
+  wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  $SUDO dpkg -i /tmp/chrome.deb 2>/dev/null || $SUDO apt-get install -f -y -qq
+fi
+```
+
+### 4.2 克隆代码
+
+```bash
+# 设置项目路径（根据服务器类型调整）
+if [[ "$(whoami)" == "ubuntu" ]]; then
+  PROJECT_DIR="/home/ubuntu/Email-Register"
+else
+  PROJECT_DIR="/home/workspace/Email-Register"
+fi
+
+git clone https://github.com/xingluoyuankong/outlook-auto-register.git "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+```
+
+### 4.3 Python 虚拟环境
+
+```bash
+# venv 缺失时先安装
+python3 -m venv --help >/dev/null 2>&1 || $SUDO apt-get install -y python3-venv 2>/dev/null || $SUDO apt-get install -y python3.13-venv
+
+# 创建虚拟环境
+VENV_DIR="$(dirname "$PROJECT_DIR")/email-register-venv"
+python3 -m venv "$VENV_DIR"
+PYTHON="$VENV_DIR/bin/python3"
+
+# 安装依赖
+$PYTHON -m pip install --upgrade pip
+$PYTHON -m pip install \
+  playwright requests aiohttp pyyaml toml \
+  fake-useragent undetected-chromedriver \
+  ddddocr httpx sqlalchemy PySocks
+
+# Playwright 浏览器
+$PYTHON -m playwright install chromium
+$SUDO $PYTHON -m playwright install-deps chromium 2>/dev/null || true
+```
+
+### 4.4 安装 Xray-core 内核
+
+```bash
+ARCH=$(uname -m)
+XRAY_DIR="$PROJECT_DIR/邮箱注册/xray_runtime"
+mkdir -p "$XRAY_DIR"
+
+# 下载 Xray-core (必须用 Xray, 不是 v2ray-core)
+case "$ARCH" in
+  x86_64)
+    URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+    ;;
+  aarch64)
+    URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+    ;;
+  *)
+    echo "不支持的架构: $ARCH"; exit 1 ;;
+esac
+
+curl -fsSL "$URL" -o /tmp/xray.zip
+cd /tmp && unzip -o xray.zip xray -d "$XRAY_DIR/"
+chmod +x "$XRAY_DIR/xray"
+
+# 也可以装到系统路径（推荐）
+$SUDO cp "$XRAY_DIR/xray" /usr/local/bin/xray
+$SUDO chmod +x /usr/local/bin/xray
+cd "$PROJECT_DIR"
+```
+
+### 4.5 安装 mihomo 内核（兜底）
+
+```bash
+MIHOMO_DIR="$PROJECT_DIR/邮箱注册/mihomo_runtime"
+mkdir -p "$MIHOMO_DIR"
+
+case "$ARCH" in
+  x86_64) URL="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.12/mihomo-linux-amd64-v1.19.12.gz" ;;
+  aarch64) URL="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.12/mihomo-linux-arm64-v1.19.12.gz" ;;
+esac
+
+curl -fsSL "$URL" -o /tmp/mihomo.gz
+gunzip -f /tmp/mihomo.gz
+mv /tmp/mihomo "$MIHOMO_DIR/mihomo-linux"
+chmod +x "$MIHOMO_DIR/mihomo-linux"
+```
+
+### 4.6 配置订阅链接
+
+```bash
+# ⚠️ 订阅链接是私密的，不要提交到 git
+# 写入订阅配置（支持多个订阅）
+$PYTHON -c "
+import json
+subs = [
+    {'url': 'YOUR_SUBSCRIPTION_URL_1', 'name': 'default'},
+    # {'url': 'YOUR_SUBSCRIPTION_URL_2', 'name': 'backup'},
+]
+json.dump(subs, open('$MIHOMO_DIR/subscriptions.json', 'w'), indent=2)
+print('订阅已配置:', len(subs), '个')
+"
+
+# 确保 .gitignore 已忽略 subscriptions.json
+# （仓库 .gitignore 已包含此规则）
+```
+
+### 4.7 配置 GitHub 凭证仓库
+
+```bash
+CLOUD_DIR="$PROJECT_DIR/云端注册邮箱"
+
+# 方式1: SSH clone（需配置 SSH key）
+git clone git@github.com:你的用户名/cloud-register-email.git "$CLOUD_DIR"
+
+# 方式2: HTTPS + Token
+GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
+git clone "https://${GITHUB_TOKEN}@github.com/你的用户名/cloud-register-email.git" "$CLOUD_DIR"
+
+# 方式3: 跳过（注册功能正常，后续手动配置）
+mkdir -p "$CLOUD_DIR"
+```
+
+### 4.8 创建运行时目录
+
+```bash
+mkdir -p "$PROJECT_DIR/runtime_outlook/logs"
+mkdir -p "$PROJECT_DIR/runtime_outlook/rt_tokens"
+mkdir -p "$PROJECT_DIR/runtime_outlook/rt_input"
+mkdir -p "$PROJECT_DIR/runtime_outlook/fail_dumps"
+chmod -R u+rwX,g+rwX "$PROJECT_DIR/runtime_outlook"
+
+# 清除 Python 缓存（避免旧 .pyc 导致修复不生效）
+find "$PROJECT_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+```
+
+### 4.9 启动 Xvfb 虚拟显示
+
+```bash
+# 清理僵尸锁
+rm -f /tmp/.X98-lock /tmp/.X11-unix/X98
+# 启动
+Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &
+sleep 2
+export DISPLAY=:98
+# 验证
+xdpyinfo -display :98 >/dev/null 2>&1 && echo "✅ Xvfb 就绪" || echo "❌ Xvfb 失败"
+```
+
+---
+
+## 五、保活配置（按服务器类型）
+
+### 5.1 Zo 服务器
+
+```bash
+# Zo 用 register_user_service（不要用 systemd）
+# 在 Zo 界面或通过 API 创建服务:
+# mode: process
+# entrypoint: /path/to/venv/bin/python3 -u outlook_daemon.py
+# workdir: /home/workspace/Email-Register
+# env_vars: DISPLAY=:98, PYTHONUNBUFFERED=1
+```
+
+### 5.2 Gcore / 普通 VPS (systemd)
+
+```bash
+USER=$(whoami)
+PROJECT_DIR=$(pwd)
+PYTHON=$(which python3)  # 或 venv 路径
+
+$SUDO tee /etc/systemd/system/outlook-auto-register.service << EOF
+[Unit]
+Description=Outlook Auto Register Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PROJECT_DIR
+Environment=DISPLAY=:98
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/bin/bash -c 'rm -f /tmp/.X98-lock /tmp/.X11-unix/X98; Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &'
+ExecStart=$PYTHON -u $PROJECT_DIR/outlook_daemon.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable outlook-auto-register
+$SUDO systemctl start outlook-auto-register
+$SUDO systemctl status outlook-auto-register
+```
+
+### 5.3 本地开发 (nohup)
+
+```bash
+export DISPLAY=:98
+export PYTHONUNBUFFERED=1
+nohup python3 -u outlook_daemon.py > /dev/shm/outlook_daemon.log 2>&1 &
+```
+
+---
+
+## 六、部署后验证
+
+```bash
+PROJECT_DIR=$(pwd)
+
+echo "=== 1. Xvfb ==="
+pgrep -f "Xvfb :98" && echo "✅" || echo "❌"
+
+echo "=== 2. daemon 运行中 ==="
+pgrep -f "outlook_daemon.py" && echo "✅" || echo "❌"
+
+echo "=== 3. xray 内核 ==="
+ss -tlnp | grep -q ":28890" && echo "✅ 28890 监听中" || echo "❌"
+curl -s --max-time 10 --proxy http://127.0.0.1:28890 https://ipinfo.io/json | jq -r '.ip // "失败"'
+
+echo "=== 4. 前端面板 ==="
+curl -s http://localhost:8765/ | head -3 && echo "✅" || echo "❌"
+
+echo "=== 5. 订阅节点数 ==="
+$PYTHON -c "
+import sys; sys.path.insert(0, '邮箱注册')
+from xray_proxy import get_xray_manager
+m = get_xray_manager()
+ok, n = m._build_config()
+print(f'xray 节点: {n}' if ok else '❌ xray 配置生成失败')
+"
+
+echo "=== 6. 手动注册测试 ==="
+echo "  cd $PROJECT_DIR"
+echo "  $PYTHON outlook_launcher.py run --count 5 --shuffle"
+```
+
+---
+
+## 七、日常运维
+
+### 7.1 查看状态
+
+```bash
+# daemon 日志
+tail -f runtime_outlook/logs/outlook_daemon.log
+
+# 注册日志
+tail -f /dev/shm/outlook_launcher.log
+
+# 前端面板
+# 浏览器访问 http://服务器IP:8765/
+
+# 注册结果
+python3 -c "
+import json
+lines = open('runtime_outlook/results.jsonl').readlines()
+ok = sum(1 for l in lines if l.strip() and json.loads(l).get('success'))
+print(f'成功: {ok}/{len([l for l in lines if l.strip()])}')
+"
+```
+
+### 7.2 手动操作
+
+```bash
+# 注册 5 个
+python3 outlook_launcher.py run --count 5 --shuffle
+
+# 注册 10 个（2线程并行，谨慎使用）
+python3 outlook_launcher.py run --count 10 --workers 2 --shuffle
+
+# 只注册不获取 RT
+python3 outlook_launcher.py run --count 5 --no-rt
+
+# 获取 RT
+python3 post_register_fetch_rt.py --limit 20 --timeout 120
+
+# 推送凭证到 GitHub
+python3 sync_credentials.py --push
+```
+
+### 7.3 代理管理
+
+```bash
+# xray 状态
+python3 邮箱注册/xray_proxy.py status
+
+# xray 节点列表
+python3 邮箱注册/xray_proxy.py nodes
+
+# xray 切换节点
+python3 邮箱注册/xray_proxy.py switch "节点名"
+
+# xray 重启
+python3 邮箱注册/xray_proxy.py restart
+
+# xray 刷新订阅
+python3 邮箱注册/xray_proxy.py refresh
+
+# 清除节点黑名单
+echo '{}' > runtime_outlook/blocked_nodes.json
+
+# 重置轮循游标
+echo '{}' > runtime_outlook/proxy_rotation.json
+```
+
+### 7.4 故障恢复
+
+```bash
+# daemon 挂了 → supervisor/systemd 自动重启
+# 如果没自动重启:
+kill $(pgrep -f outlook_daemon.py)  # Zo: supervisor 会拉起
+# 或
+sudo systemctl restart outlook-auto-register  # VPS
+
+# Chrome 残留导致 OOM
+pkill -9 -f 'cdp_outl\|cdp_reg\|outlook.*user-data'
+# ⚠️ 不要 pkill -9 chrome（会杀 agent-browser）
+
+# 调度状态残留（跳过注册）
+echo '{}' > runtime_outlook/daemon_schedule.json
+
+# 清除 Python 缓存
+find . -name __pycache__ -exec rm -rf {} +
+```
+
+---
+
+## 八、不同服务器适配要点
+
+### 8.1 Zo 服务器
+
+- 用户: root，无需 sudo
+- 保活: `register_user_service` (mode=process)
+- 路径: `/home/workspace/Email-Register`
+- 特殊: 不能用 systemd，用 supervisor
+- 浏览器: 已预装 Google Chrome + Chromium
+- 日志: `/dev/shm/` (tmpfs)
+
+### 8.2 Gcore VPS (Ubuntu 22.04)
+
+- 用户: ubuntu，需要 sudo
+- 保活: systemd
+- 路径: `/home/ubuntu/Email-Register`
+- ⚠️ python3-venv 缺失: `sudo apt install python3.13-venv || sudo apt install python3-venv`
+- ⚠️ pip 限制: 用 venv 或 `--break-system-packages`
+- ⚠️ libasound2 包名: `libasound2t64` 或 `libasound2`
+- 内存: 4GB，串行注册，每批最多 5 个
+- 磁盘: 14GB，注意日志不要写满
+
+### 8.3 普通 VPS (Debian 12)
+
+- 用户: root 或普通用户
+- 保活: systemd
+- 路径: `~/Email-Register`
+- 基本同 Gcore，包名更标准
+
+### 8.4 本地开发机
+
+- 保活: nohup + 手动管理
+- 可直接用系统 Python
+- 注意 DISPLAY 环境变量
+
+---
+
+## 九、关键注意事项
+
+### 9.1 内核选型
+
+| 需求 | 内核 | 原因 |
 |------|------|------|
-| **主节点** | zo (xzxyuan) | 注册 + 凭证汇总 + git push |
-| **工作节点** | zo2, gcore | 只注册，凭证由主节点收集 |
+| reality 协议节点 | **Xray-core** | v2ray-core 不支持 reality |
+| clash 格式订阅 | mihomo | xray 不直接解析 clash YAML |
+| 通用兜底 | mihomo | 支持全部 clash 节点类型 |
 
-### 9.3 远程部署
+**本系统**：xray 为主内核（直接抓订阅解析 vless），mihomo 为兜底。
 
-```bash
-# 部署到远程节点
-bash deploy/remote_deploy.sh zo2
-bash deploy/remote_deploy.sh gcore
+### 9.2 不要做的事
 
-# 收集远程节点凭证
-python3 deploy/collect_all_nodes.py
+1. ❌ 不要 `pkill -9 chrome`（杀掉 agent-browser）
+2. ❌ 不要用 headless 浏览器（Outlook 检测并拦截）
+3. ❌ 不要用 v2ray-core（不支持 Reality）
+4. ❌ 不要多线程同时 switch_node（互相覆盖）
+5. ❌ 不要推送 subscriptions.json / config.yaml / 凭证目录
+6. ❌ 不要用 `ClashForAndroid` User-Agent 抓订阅（返回空壳）
+7. ❌ 不要忘记清 `__pycache__`（旧缓存导致修复不生效）
 
-# 触发远程节点注册
-bash deploy/trigger_all_nodes_round.sh
-```
+### 9.3 必须做的事
 
----
-
-## 十、FAQ 快速排障表
-
-| 症状 | 可能原因 | 快速修复 |
-|------|----------|----------|
-| Daemon 不注册了 | 代理挂了 | `curl -x socks5h://127.0.0.1:1080 https://ipinfo.io` 检查 |
-| "Killed" in log | OOM | `kill_orphan_chrome_processes()` + 增加 swap |
-| 注册全部失败 | IP 被封 | 换 WARP / 等 1h |
-| 面板打不开 | 8765 端口被占 | `lsof -i :8765` + kill 占用进程 |
-| Git push 失败 | rebase 卡住 | `cd 云端注册邮箱 && git rebase --abort` |
-| RT 获取失败 | 验证码 | 等 30min 手动重试 |
-| Chrome 启动失败 | Xvfb 没运行 | `Xvfb :98 -screen 0 1366x768x24 -ac -nolisten tcp &` |
-| 内存不足 | 幽灵浏览器 | `python3 cleanup.py` |
-| 凭证重复 | 文件名不一致 | `sync_credentials.py --push` (自动修复) |
-| 前端 iframe 空白 | API 路由挂了 | 检查 `/api/outlook` 路由配置 |
-| Daemon 反复重启 | 未知异常 | 查 `runtime_outlook/logs/outlook_daemon.log` |
-| sync exit=1 | git 状态异常 | `_ensure_clean_git_state()` (已内置) |
+1. ✅ Xvfb :98 必须先启动，所有子进程 `export DISPLAY=:98`
+2. ✅ 注册后清理 Chrome 孤儿进程
+3. ✅ 修改代码后清除 `__pycache__`
+4. ✅ account_blocked 后拉黑节点 4h
+5. ✅ RT 用新浏览器获取（无登录态）
+6. ✅ 订阅 User-Agent 用 `v2rayN/6.0`（不是 ClashForAndroid）
+7. ✅ xray routing.rules 设为空数组（走第一个 outbound）
 
 ---
 
-## 附录 A: 关键文件清单
-
-```
-Email-Register/
-├── outlook_daemon.py                    # 核心守护进程
-├── outlook_daemon_hub_primary.sh        # Hub 启动脚本
-├── outlook_dashboard_server.py          # 前端面板服务
-├── sync_credentials.py                  # 凭证同步推送
-├── post_register_fetch_rt.py           # RT 获取
-├── cleanup.py                           # 幽灵浏览器清理
-├── integrated_server.py                 # 集成服务器
-├── full_pipeline.py                     # 完整流水线
-├── requirements.txt                     # Python 依赖
-├── OPERATIONS.md                        # 运维规范
-├── DEPLOY_GUIDE.md                      # 本文档
-├── README.md                            # 项目说明
-├── .gitignore                           # Git 忽略规则
-├── 邮箱注册/                             # 核心注册库
-│   ├── cdp_outlook.py                   # CDP Outlook 注册
-│   ├── subscription_proxy.py            # 代理订阅管理
-│   └── ...
-├── deploy/                              # 部署脚本
-│   ├── remote_deploy.sh
-│   ├── collect_all_nodes.py
-│   └── ...
-├── outlook-token-tool/                  # RT 获取工具
-│   ├── batch_rt.py
-│   ├── get_outlook_token.py
-│   └── ...
-├── runtime_outlook/                     # 运行时数据 (gitignored)
-│   ├── logs/
-│   ├── rt_tokens/
-│   └── results.jsonl
-└── 云端注册邮箱/                         # 凭证仓库 (gitignored from main)
-    ├── 三凭证/
-    ├── 四凭证/
-    ├── all_success.jsonl
-    └── .git/
-```
-
-## 附录 B: 环境变量速查
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DISPLAY` | `:98` | Xvfb 虚拟显示 |
-| `OUTLOOK_DASHBOARD_PORT` | `8765` | 面板端口 |
-| `HTTP_PROXY` | - | HTTP 代理 |
-| `HTTPS_PROXY` | - | HTTPS 代理 |
-| `NO_PROXY` | `localhost,127.0.0.1` | 不走代理的地址 |
-| `CLOUD_REGISTER_EMAIL_REMOTE` | `git@github.com:...` | 凭证仓库远程地址 |
-| `NGROK_AUTHTOKEN` | - | ngrok 认证 token |
-
-## 附录 C: Cron 任务
-
-```bash
-# 每天 00:00 同步推送凭证 (由 daemon 内置 cron 处理，无需系统 crontab)
-# 每天 06:00 更新代理订阅 (由 daemon 内置处理)
-
-# 如果需要独立 cron:
-0 0 * * * cd /home/workspace/Email-Register && python3 sync_credentials.py --push >> runtime_outlook/logs/sync.log 2>&1
-0 6 * * * cd /home/workspace/Email-Register && python3 邮箱注册/subscription_proxy.py --update >> runtime_outlook/logs/proxy.log 2>&1
-```
-
----
-
-*文档版本: v2.0 | 最后更新: 2026-06-20 | 维护者: Zo 工作空间*
+*文档版本: v1.0 | 最后更新: 2026-06-26*

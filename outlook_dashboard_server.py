@@ -69,6 +69,94 @@ def _mihomo_put(path: str, data: dict, timeout: float = 5) -> bool:
 
 # ─── 代理管理 ────────────────────────────────────────────────
 
+# ─── Xray 内核管理 ───────────────────────────────────────────
+import sys as _sys
+_sys.path.insert(0, str(ROOT / "邮箱注册"))
+
+def _xray_manager():
+    """懒加载 xray 管理器单例。"""
+    try:
+        from xray_proxy import get_xray_manager
+        return get_xray_manager()
+    except Exception as e:
+        return None
+
+def xray_status() -> dict:
+    """xray 内核状态（含节点列表、当前节点、出口IP）。"""
+    mgr = _xray_manager()
+    if not mgr:
+        return {"running": False, "error": "xray 模块加载失败"}
+    mgr._load_node_state()  # 重载持久化状态（switch/refresh 可能由其他进程更新）
+    return mgr.status()
+
+def xray_nodes() -> list[dict]:
+    """xray 节点列表。"""
+    mgr = _xray_manager()
+    if not mgr:
+        return []
+    mgr._load_node_state()
+    return mgr.nodes()
+
+def xray_switch_node(name: str) -> dict:
+    mgr = _xray_manager()
+    if not mgr:
+        return {"ok": False, "msg": "xray 模块加载失败"}
+    ok, msg = mgr.switch_node(name)
+    return {"ok": ok, "msg": msg}
+
+def xray_restart() -> dict:
+    mgr = _xray_manager()
+    if not mgr:
+        return {"ok": False, "msg": "xray 模块加载失败"}
+    ok, msg = mgr.restart()
+    return {"ok": ok, "msg": msg}
+
+def xray_refresh() -> dict:
+    """重新抓取订阅 + 重建配置 + 重启 xray。"""
+    mgr = _xray_manager()
+    if not mgr:
+        return {"ok": False, "msg": "xray 模块加载失败"}
+    ok, msg = mgr.refresh_subscriptions()
+    return {"ok": ok, "msg": msg}
+
+def xray_test_all() -> dict:
+    """并发测试所有 xray 节点的 TCP 连通性（快速，不切换节点）。"""
+    import socket, concurrent.futures
+    mgr = _xray_manager()
+    if not mgr:
+        return {"ok": False, "tested": 0, "alive": 0, "nodes": []}
+    mgr._load_node_state()
+    nodes = mgr.nodes()
+
+    def tcp_test(n):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(4)
+            s.connect((n.get("server", ""), int(n.get("port", 0))))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(tcp_test, nodes))
+    out = []
+    alive = 0
+    for n, ok in zip(nodes, results):
+        nn = dict(n)
+        nn["alive"] = bool(ok)
+        if ok:
+            alive += 1
+        out.append(nn)
+    return {"ok": True, "tested": len(nodes), "alive": alive, "nodes": out}
+
+def xray_test() -> dict:
+    mgr = _xray_manager()
+    if not mgr:
+        return {"ok": False, "error": "xray 模块加载失败"}
+    return mgr.test_proxy()
+
+
 def proxy_status() -> dict:
     """获取代理总状态"""
     version = _mihomo_get("/version")
@@ -760,6 +848,7 @@ th{color:var(--muted);font-weight:500}
     <div class="tab" onclick="switchTab('proxy-nodes')">🌐 节点管理</div>
     <div class="tab" onclick="switchTab('proxy-subs')">📋 订阅管理</div>
     <div class="tab" onclick="switchTab('proxy-residential')">🏠 住宅代理</div>
+    <div class="tab" onclick="switchTab('xray-kernel')">⚡ Xray 内核</div>
   </div>
 
   <!-- 代理状态 -->
@@ -826,6 +915,34 @@ th{color:var(--muted);font-weight:500}
     </div>
     <div id="res-list" style="margin-top:.5rem"></div>
   </div>
+
+  <!-- Xray 内核 (v2ray 系) -->
+  <div id="tab-xray-kernel" class="tab-content">
+    <p style="font-size:.82rem;color:var(--muted);margin:0 0 .5rem">
+      ⚡ Xray-core (v2ray 系内核) — 原生支持 VLESS/XTLS/Reality。端口 socks 28889 / http 28890，与 mihomo 并存，统一纳入后端保活。
+      <br>共享同一套订阅链接（含 Clash 订阅），独立抓取生成节点。
+    </p>
+    <dl id="xray-info">
+      <dt>xray-core</dt><dd id="x-running">检测中...</dd>
+      <dt>出口代理</dt><dd id="x-proxy-url">—</dd>
+      <dt>节点数</dt><dd id="x-nodes">—</dd>
+      <dt>当前节点</dt><dd id="x-current">—</dd>
+      <dt>出口 IP</dt><dd id="x-ip">—</dd>
+    </dl>
+    <div class="btn-row" style="margin-top:.6rem">
+      <button class="btn sm" onclick="xrayRefresh()">🔄 刷新订阅</button>
+      <button class="btn sm" onclick="xrayTest()">🏓 测试出口</button>
+      <button class="btn sm warn" onclick="xrayRestart()">🔁 重启内核</button>
+      <button class="btn sm" onclick="loadXrayStatus()">📊 刷新状态</button>
+    </div>
+    <div class="btn-row" style="margin-top:.4rem">
+      <button class="btn sm ok" onclick="xrayAutoTest()">⚡ 全部测速</button>
+      <span id="xray-summary" style="font-size:.8rem;color:var(--muted);line-height:2"></span>
+    </div>
+    <div class="node-list" id="xray-node-list">
+      <div style="padding:1rem;text-align:center;color:var(--muted)">点击「刷新状态」加载节点</div>
+    </div>
+  </div>
 </div>
 
 <!-- 最近注册结果 -->
@@ -853,9 +970,8 @@ function switchTab(name) {
   document.querySelector(`.tab[onclick="switchTab('${name}')"]`).classList.add('active');
   $('tab-' + name).classList.add('active');
   if (name === 'proxy-nodes') loadNodes();
-  if (name === 'proxy-subs') loadSubs();
-  if (name === 'proxy-residential') loadResidential();
   if (name === 'proxy-status') loadProxyStatus();
+  if (name === 'xray-kernel') loadXrayStatus();
 }
 
 // ─── Toast ───
@@ -976,6 +1092,29 @@ async function loadNodes() {
   }
 }
 
+function renderXrayNodes(nodes) {
+  const el = $('xray-node-list');
+  if (!el) return;
+  if (!nodes.length) {
+    el.innerHTML = '<div style="padding:1rem;text-align:center;color:var(--muted)">暂无节点</div>';
+    return;
+  }
+  const sorted = [...nodes].sort((a, b) => (a.current ? -1 : 0) - (b.current ? -1 : 0) || a.name.localeCompare(b.name));
+  el.innerHTML = sorted.map(n => {
+    const cur = n.current ? 'current' : '';
+    const curTag = n.current ? ' <span style="color:var(--good);font-size:.72rem">● 当前</span>' : '';
+    const sp = (n.server||'') + ':' + (n.port||'');
+    return `<div class="node-item ${cur}">
+      <span class="alive-dot ${n.current?'on':'off'}" style="cursor:default"></span>
+      <span class="node-name" title="${n.name}\n${sp}">${n.name}${curTag}</span>
+      <span class="node-meta">
+        <span style="color:var(--muted);font-size:.72rem">${sp}</span>
+        <button class="btn sm" onclick="switchXrayNode('${n.name.replace(/'/g,"\\'")}')">切换</button>
+      </span>
+    </div>`;
+  }).join('');
+}
+
 function renderNodeList(nodes) {
   if (!nodes.length) {
     $('node-list').innerHTML = '<div style="padding:1rem;text-align:center;color:var(--muted)">暂无节点</div>';
@@ -1076,6 +1215,69 @@ async function testAllNodes() {
 }
 
 // ─── 订阅管理 ───
+async function loadXrayStatus() {
+  try {
+    const d = await api('/api/xray/status');
+    $('x-running').textContent = d.running ? '✅ 运行中 ' + (d.exit_country ? '· 出口 ' + d.exit_country : '') : '❌ 未运行';
+    $('x-proxy-url').textContent = d.running ? 'http://127.0.0.1:' + (d.http_port||28890) : '—';
+    $('x-nodes').textContent = d.node_count || '—';
+    $('x-current').textContent = d.current_node || '—';
+    $('x-ip').textContent = d.exit_ip ? (d.exit_ip + ' (' + (d.exit_country||'') + ')') : '—';
+    renderXrayNodes(d.nodes || []);
+  } catch(e) { $('x-running').textContent = '❌ 连接失败: ' + e.message; }
+}
+
+async function xrayTest() {
+  toast('⏳ 测试中...');
+  try {
+    const d = await api('/api/xray/test', 'POST');
+    if (d.ok) {
+      $('x-ip').textContent = d.ip + ' (' + (d.country||'') + ')';
+      toast('✅ 出口: ' + d.ip);
+    } else {
+      $('x-ip').textContent = '❌ ' + (d.error||'失败');
+      toast('❌ ' + (d.error||'测试失败'), 'err');
+    }
+  } catch(e) { toast('❌ ' + e, 'err'); }
+}
+
+async function xrayRefresh() {
+  toast('⏳ 正在刷新代理...');
+  try {
+    const d = await api('/api/xray/refresh', 'POST');
+    toast(d.ok ? '✅ ' + d.msg : '❌ ' + d.msg, d.ok ? 'ok' : 'err');
+    loadXrayStatus();
+  } catch(e) { toast('❌ ' + e, 'err'); }
+}
+
+async function xrayRestart() {
+  toast('⏳ 正在重启内核...');
+  try {
+    const d = await api('/api/xray/restart', 'POST');
+    toast(d.ok ? '✅ ' + d.msg : '❌ ' + d.msg, d.ok ? 'ok' : 'err');
+    loadXrayStatus();
+  } catch(e) { toast('❌ ' + e, 'err'); }
+}
+
+async function xrayAutoTest() {
+  toast('⏳ 正在测速所有节点...');
+  try {
+    const d = await api('/api/xray/test-all', 'POST');
+    const s = $('xray-summary'); if (s) s.textContent = `共 ${d.tested||0} 个节点，${d.alive||0} 个可用`;
+    toast(`✅ 测速完成: ${d.alive}/${d.tested} 存活`);
+    renderXrayNodes(d.nodes || []);
+  } catch(e) { toast('❌ ' + e, 'err'); }
+}
+
+async function switchXrayNode(name) {
+  toast('⏳ 切换节点 + 重启内核中...');
+  try {
+    const d = await api('/api/xray/switch', 'POST', {name: name});
+    toast(d.ok ? '✅ ' + d.msg : '❌ ' + d.msg, d.ok ? 'ok' : 'err');
+    if (d.ok) setTimeout(loadXrayStatus, 1200);
+  } catch(e) { toast('❌ ' + e, 'err'); }
+}
+
 async function loadSubs() {
   try {
     const d = await api('/api/proxy/status');
@@ -1212,6 +1414,7 @@ async function deactivateResidential() {
 
 // ─── 初始化 ───
 loadProxyStatus();
+loadXrayStatus();
 
 
 // Progress tracking
@@ -1424,7 +1627,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"residential": _load_residential()})
             return
 
-        
+        # ─── Xray 内核 API ───
+        if path == "/api/xray/status":
+            self._json(xray_status())
+            return
+        if path == "/api/xray/nodes":
+            self._json({"nodes": xray_nodes()})
+            return
+
+        # ─── 注册进度
         if path == "/api/register/progress":
             self._json(registration_progress)
             return
@@ -1510,6 +1721,25 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/proxy/auto-rotate":
             self._json(proxy_auto_rotate())
+            return
+
+        # ─── Xray 内核 API ───
+        if path == "/api/xray/switch":
+            name = body.get("name", "")
+            self._json(xray_switch_node(name))
+            return
+        if path == "/api/xray/restart":
+            self._json(xray_restart())
+            return
+        if path == "/api/xray/refresh":
+            self._json(xray_refresh())
+            return
+        if path == "/api/xray/test":
+            self._json(xray_test())
+            return
+
+        if path == "/api/xray/test-all":
+            self._json(xray_test_all())
             return
 
         self.send_error(404)
