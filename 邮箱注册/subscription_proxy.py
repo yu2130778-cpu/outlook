@@ -146,7 +146,7 @@ def _parse_subscription_text(text: str) -> dict:
 
 # ─── 常量 ───
 MIHOMO_DIR = Path(__file__).parent / "mihomo_runtime"
-MIHOMO_EXE = MIHOMO_DIR / "mihomo.exe"
+MIHOMO_EXE = MIHOMO_DIR / "mihomo"
 MIHOMO_LINUX = MIHOMO_DIR / "mihomo-linux"
 CONFIG_PATH = MIHOMO_DIR / "config.yaml"
 SUBS_FILE = MIHOMO_DIR / "subscriptions.json"
@@ -191,7 +191,7 @@ def _kill_all_mihomo():
     """杀掉所有 mihomo 进程"""
     try:
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/IM", "mihomo.exe"],
+            subprocess.run(["taskkill", "/F", "/IM", "mihomo"],
                            capture_output=True, timeout=5)
         else:
             subprocess.run(["pkill", "-f", "mihomo"],

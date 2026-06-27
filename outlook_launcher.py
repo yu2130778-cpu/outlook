@@ -315,31 +315,58 @@ class ProxyRotator:
             return self._next_unlocked()
 
     def _next_unlocked(self) -> str:
+        # ===== 自动三阶梯代理 =====
+        # Tier1: 内核代理 → Tier3: 静态代理 → 自动循环
         self._ensure_kernel()
-        # 无内核 → 静态代理轮循
-        if not (self.use_xray and self.xray.is_running) and not self.manager.is_running:
+        has_kernel = (self.use_xray and self.xray.is_running) or self.manager.is_running
+
+        # 先刷新内核节点快照
+        if has_kernel and not self.nodes:
+            self._refresh_snapshot()
+        N = len(self.nodes) if has_kernel else 0
+
+        # 内核节点全部被封/不可用 → 切到静态代理
+        if has_kernel and self.cycle_tested >= N and len(self.used_this_round) == 0 and self.static:
+            log.info("[AUTO-TIER] 内核节点全部不可用, 自动切到机场代理(Tier3)")
+            has_kernel = False  # 强制走静态
+
+        # 无可用内核 → 静态代理轮循
+        if not has_kernel:
             if not self.static:
+                log.warning("[AUTO-TIER] 无任何代理可用")
                 return ""
             for _ in range(len(self.static)):
                 proxy = self.static[self.cursor % len(self.static)]
                 self.cursor += 1
                 if self.fail_count.get(proxy, 0) < 3:
                     return proxy
-            return self.static[self.cursor % len(self.static)] if self.static else ""
+            # 静态代理全部失败 → 尝试回内核
+            log.info("[AUTO-TIER] 静态代理全部失败, 尝试切回内核")
+            if has_kernel:
+                self.cycle_tested = 0
+                self._refresh_snapshot()
+            else:
+                self.fail_count.clear()
+                return self.static[self.cursor % len(self.static)] if self.static else ""
 
-        if not self.nodes:
-            self._refresh_snapshot()
-        N = len(self.nodes)
+        # 内核节点数为零
         if N == 0:
             return self._kernel_proxy_url()
 
+        # 内核节点轮询
         while True:
-            # 一轮遍历完成（全部节点都试过一遍）
             if self.cycle_tested >= N:
                 usable = len(self.used_this_round)
                 if usable == 0:
-                    log.warning("🔄 ===== 第 %d 轮遍历全部 %d 节点均不可用，用当前节点兜底 =====", self.round, N)
+                    log.warning("[AUTO-TIER] 第 %d 轮全部 %d 节点均不可用, 切到机场代理", self.round, N)
                     self._save_state()
+                    # 尝试静态代理
+                    if self.static:
+                        for _ in range(len(self.static)):
+                            proxy = self.static[self.cursor % len(self.static)]
+                            self.cursor += 1
+                            if self.fail_count.get(proxy, 0) < 3:
+                                return proxy
                     return self._kernel_proxy_url()
                 log.info("🔄 ===== 第 %d 轮代理轮循完成: 遍历全部 %d 节点, 可用 %d 个, 开始第 %d 轮 =====",
                          self.round, N, usable, self.round + 1)
@@ -668,6 +695,7 @@ def main() -> int:
         mgr = get_manager()
         status = {
             "static_proxy_count": len(load_proxy_lines()),
+            "force_static": (RUN_DIR / "force_static").exists(),
             "proxy_file": str(PROXY_FILE),
             "subscription_proxy": mgr.status(),
             "result_file": str(RESULT_FILE),

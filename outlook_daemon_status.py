@@ -12,7 +12,7 @@ STATUS_PATH = ROOT / "runtime_outlook" / "daemon_status.json"
 SCHEDULE_PATH = ROOT / "runtime_outlook" / "daemon_schedule.json"
 LOG_FILE = ROOT / "runtime_outlook" / "logs" / "outlook_daemon.log"
 RESULTS_FILE = ROOT / "runtime_outlook" / "results.jsonl"
-DEPLOY_TS = 1780774138  # 2026-06-06T19:28:58 UTC, when the daemon service was first deployed
+DEPLOY_TS = 1782495147  # 2026-06-06T19:28:58 UTC, when the daemon service was first deployed
 
 ZO_USER = os.environ.get("ZO_USER", "") or os.environ.get("ZO_HOST_KEY", "") or "user"
 

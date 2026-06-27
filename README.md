@@ -12,19 +12,17 @@
 
 ------
 
-邮箱注册 is a Python library designed to streamline the process of creating email accounts across various top email provider services. With 邮箱注册, you can automate the creation of email accounts, saving time and effort. It provides an easy-to-use interface for creating accounts with customizable options.
+Outlook 自动注册系统 — 专为 Outlook 邮箱批量自动注册设计的生产级工具。支持三阶梯代理架构（内核代理订阅 + 住宅代理 + 机场免费代理），自动轮询节点、验证码自动解决、refresh_token 自动提取、凭证自动推送 GitHub 私有仓库。已部署于 AWS Lightsail 东京节点 24x7 不间断运行，日均注册 100+ 账号，成功率 72%+。
 
 ## Features
 
-- **Automated Account Creation:** 邮箱注册 streamlines the process of creating email accounts by automating the necessary steps.
-- **Support for Major Email Providers:** 邮箱注册 supports a wide range of popular email service providers including Gmail, Outlook and Yahoo, giving you flexibility in choosing the provider that suits your needs.
-- **Python Integration:** 邮箱注册 seamlessly integrates into Python projects, allowing for efficient automation of email account creation.
-- **Auto-generated Account Details:** Generate random account details for username, password, first name, last name, country, and birthdate if not provided, allowing for quick creation of multiple accounts for testing or other purposes.
-- **Customizable Options:** Customize account details such as username, password, first name, last name, country, and birthdate to meet your specific requirements.
-- **Error Handling and Logging:** 邮箱注册 provides error handling capabilities and logs activities to facilitate debugging and tracking of account creation actions.
-- **Open-Source and Extensible:** Being an open-source project, 邮箱注册 encourages contributions and allows for further extension and improvement of its functionalities.
-- **Proxy Support:** 邮箱注册 includes proxy support, giving users the option to use their own proxies for account creation, including support for authenticated proxies. This feature allows for enhanced privacy, security, and flexibility during the email account creation process.
-- **Free Proxy Option:** Additionally, 邮箱注册 offers an option to automatically retrieve and use free proxies. This feature provides users with a convenient solution for proxy usage, eliminating the need for purchasing or configuring proxies separately.
+- **Outlook 自动注册:** Chrome + Xvfb 非 headless 模式，自动填表、验证码解决（hsprotect）、注册成功判读
+- **三阶梯代理架构:** 第一阶梯内核代理（xray 主 + mihomo 备用，订阅链接驱动）→ 第二阶梯住宅代理 → 第三阶梯机场免费代理（auto-proxy-fetcher 自动拉取验证导入），自动按阶梯切换，无需手动干预
+- **连续不间断注册:** 单账号模式，间隔 5-10 秒，180 秒超时保护自动跳过卡死，孤儿 Chrome 自动清理，systemd 保活
+- **凭证自动管理:** 注册成功自动提取 refresh_token，每天午夜自动推送四凭证到 GitHub 私有仓库
+- **节点轮询与拉黑:** 每个账号自动轮询下一个可用节点，被封 IP 拉黑 3-4 小时自动恢复
+- **Web 面板:** 实时状态监控、节点管理、订阅管理、机场代理拉取验证、手动注册控制（支持 ngrok 内网穿透）
+- **多云部署:** 支持 AWS Lightsail / Zo Computer / Gcore / 阿里云等多种云环境一键部署（见 AI_DEPLOY_GUIDE.md）
 
 ## Installation
 
@@ -573,3 +571,64 @@ find 邮箱注册 -name "__pycache__" -type d | wc -l  # 应为 0
 - [优化记录](OPTIMIZATION_LOG.md) — 历次优化要点与变更记录
 - [根因分析](ROOT_CAUSE_ANALYSIS.md) — 注册失败的根本原因分析
 - [运维笔记](OPERATIONS.md) — 日常运维操作手册
+
+
+---
+
+## 🛠️ 生产优化记录（2026-06-27, 叶佬 Japan 服务器）
+
+### 三阶梯代理自动切换（outlook_launcher.py）
+
+`ProxyRotator._next_unlocked()` 已改为自动阶梯切换逻辑：
+
+1. **Tier1 内核代理优先** — 通过 xray（主，:28889/:28890）/ mihomo（备用，:28888）订阅节点轮询
+2. **内核节点全部不可用 → 自动切 Tier3 机场代理** — `[AUTO-TIER]` 日志标记
+3. **静态代理全部失败 → 自动回内核** — 无需重启服务
+
+**关键修改行:** outlook_launcher.py `_next_unlocked()` 方法
+
+### mihomo Linux 兼容修复（subscription_proxy.py）
+
+Linux 环境下 `mihomo.exe` 改为 `mihomo`。部署时需确保已下载 `mihomo-linux` 二进制并创建 `mihomo` 软链接。
+
+### 机场代理面板（outlook_dashboard_server.py）
+
+新增 `✈️ 机场代理` Tab，支持：
+- 实时查看代理池状态（总量/已验证/上次导入时间）
+- 一键拉取+验证+导入（严格双重验证：出口IP≠直连 + 能访问 Google HTTPS）
+- 代理列表展示每个代理的出口 IP
+- `POST /api/airport/fetch` + `GET /api/airport/status` API
+
+### 连续注册优化（continuous_register.sh）
+
+- `| tail -3` 管道已移除 → 全量日志输出，不再误判"卡住"
+- `timeout 180` 保护 → 真卡死自动跳过
+- 孤儿 Chrome 自动清理 → 防止 OOM
+- systemd 服务 `outlook-continuous.service` 保活
+
+### 自动监控脚本（monitor.sh）
+
+- 每 60 秒巡检：服务存活、日志更新、注册进度
+- 5 分钟无输出 + 进程存活 → 确认真卡死 → 杀进程重启
+- 日志文件: `runtime_outlook/logs/monitor_report.log`
+
+### 服务器时区
+
+已设为 `Asia/Shanghai` (CST, +0800)，所有日志统一北京时间。
+
+### 配套服务
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| outlook-continuous | - | 连续注册循环 |
+| outlook-dashboard | 8765 | Web 管理面板 |
+| proxy-fetcher | 8088 | 机场代理拉取验证 |
+| ngrok-dashboard | - | 内网穿透 |
+
+### 当前部署状态
+
+- 服务器: AWS Lightsail 东京 18.181.129.190 (Ubuntu 24.04, 2GB RAM)
+- 面板: https://floral-expanse-ravioli.ngrok-free.dev
+- 用户名: 叶佬（赞助）
+- 总注册: 166 次, 成功率 72%
+- 内核代理成功: 118 次, 机场代理成功: 3 次

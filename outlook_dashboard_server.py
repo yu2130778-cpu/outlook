@@ -157,6 +157,106 @@ def xray_test() -> dict:
     return mgr.test_proxy()
 
 
+
+def airport_status():
+    """机场代理状态"""
+    import os, time
+    apt_file = '/home/ubuntu/Email-Register/runtime_outlook/airport_proxies.txt'
+    proxies = []
+    if os.path.exists(apt_file):
+        with open(apt_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    proxies.append({'url': line[:70], 'ip': line.split('://')[-1].split(':')[0] if '://' in line else '?'})
+    mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(apt_file))) if os.path.exists(apt_file) else '从未'
+    try:
+        import subprocess, json
+        r = subprocess.run(['curl', '-s', 'http://127.0.0.1:8088/api/proxy/pool/urls'], capture_output=True, text=True, timeout=5)
+        pool_data = json.loads(r.stdout) if r.stdout else {}
+        pool_size = pool_data.get('count', len(pool_data.get('proxies', [])))
+    except:
+        pool_size = 'N/A'
+    return {'pool_size': pool_size, 'verified_count': len(proxies), 'last_import': mtime, 'proxies': proxies[:20]}
+
+def airport_fetch_and_import():
+    """手动触发: 拉取代理 → 严格验证 → 导入"""
+    import subprocess, json, concurrent.futures, sys, os
+    DIRECT = '18.181.129.190'
+    
+    # 1. 触发抓取
+    subprocess.run(['curl', '-s', '-X', 'POST', 'http://127.0.0.1:8088/api/fetch?count=50'], timeout=30, capture_output=True)
+    
+    # 2. 等抓取完成一些
+    import time; time.sleep(8)
+    
+    # 3. 获取代理池
+    r = subprocess.run(['curl', '-s', 'http://127.0.0.1:8088/api/proxy/pool/urls'], capture_output=True, text=True, timeout=10)
+    try:
+        data = json.loads(r.stdout)
+        proxies = data.get('proxies', [])
+    except:
+        return {'error': '获取代理池失败', 'total': 0, 'verified': 0}
+    
+    total = len(proxies)
+    seen = set()
+    working = []
+    
+    def test_one(p):
+        url = p.strip()
+        if url in seen: return None
+        seen.add(url)
+        try:
+            if url.startswith('socks5'):
+                hp = url.replace('socks5://', '')
+                r2 = subprocess.run(['curl', '-s', '--connect-timeout', '5', '--max-time', '8', '--socks5', hp,
+                    'https://httpbin.org/ip'], capture_output=True, text=True, timeout=10)
+            elif url.startswith('http'):
+                r2 = subprocess.run(['curl', '-s', '--connect-timeout', '5', '--max-time', '8', '--proxy', url,
+                    'https://httpbin.org/ip'], capture_output=True, text=True, timeout=10)
+            else: return None
+            if r2.returncode == 0 and 'origin' in r2.stdout:
+                ip = json.loads(r2.stdout).get('origin', '')
+                if ip and ip != DIRECT:
+                    # 二次验证: 能访问google
+                    if url.startswith('socks5'):
+                        r3 = subprocess.run(['curl', '-s', '--connect-timeout', '5', '--max-time', '8', '--socks5', hp,
+                            '-o', '/dev/null', '-w', '%{http_code}', 'https://www.google.com'], capture_output=True, text=True, timeout=10)
+                    else:
+                        r3 = subprocess.run(['curl', '-s', '--connect-timeout', '5', '--max-time', '8', '--proxy', url,
+                            '-o', '/dev/null', '-w', '%{http_code}', 'https://www.google.com'], capture_output=True, text=True, timeout=10)
+                    code = r3.stdout.strip()
+                    if code in ['200', '301', '302']:
+                        return (url, ip)
+        except: pass
+        return None
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        futures = {ex.submit(test_one, p): p for p in proxies}
+        for fut in concurrent.futures.as_completed(futures):
+            r = fut.result()
+            if r:
+                working.append(r)
+                if len(working) >= 40: break
+    
+    # 4. 写入文件
+    apt_file = '/home/ubuntu/Email-Register/runtime_outlook/airport_proxies.txt'
+    with open(apt_file, 'w') as f:
+        for url, ip in working:
+            f.write(f"{url}\n")
+    
+    # 5. 导入到Outlook系统
+    subprocess.run(['/home/ubuntu/email-register-venv/bin/python3',
+        '/home/ubuntu/Email-Register/outlook_launcher.py', 'import-proxies', apt_file, '--replace'],
+        capture_output=True, timeout=10)
+    
+    # 6. 清空被拉黑的节点(新代理来了旧黑名单作废)
+    with open('/home/ubuntu/Email-Register/runtime_outlook/blocked_nodes.json', 'w') as f:
+        f.write('{}')
+    
+    return {'total': total, 'verified': len(working), 'proxies': [{'url': u[:60], 'ip': ip} for u, ip in working[:10]]}
+
+
 def proxy_status() -> dict:
     """获取代理总状态"""
     version = _mihomo_get("/version")
@@ -848,6 +948,7 @@ th{color:var(--muted);font-weight:500}
     <div class="tab" onclick="switchTab('proxy-nodes')">🌐 节点管理</div>
     <div class="tab" onclick="switchTab('proxy-subs')">📋 订阅管理</div>
     <div class="tab" onclick="switchTab('proxy-residential')">🏠 住宅代理</div>
+    <div class="tab" onclick="switchTab('airport-proxy')">✈️ 机场代理</div>
     <div class="tab" onclick="switchTab('xray-kernel')">⚡ Xray 内核</div>
   </div>
 
@@ -914,6 +1015,26 @@ th{color:var(--muted);font-weight:500}
       <button class="btn sm warn" onclick="deactivateResidential()">⏹ 停用住宅代理</button>
     </div>
     <div id="res-list" style="margin-top:.5rem"></div>
+  </div>
+
+  <!-- 机场代理 (auto-proxy-fetcher) -->
+  <div id="tab-airport-proxy" class="tab-content">
+    <p style="font-size:.82rem;color:var(--muted);margin:0 0 .5rem">
+      由 auto-proxy-fetcher 自动拉取 + 严格验证（出口IP必须改变 + 能访问Google HTTPS）
+      <br>内核代理节点耗尽/被封时自动切换到此阶梯。
+    </p>
+    <dl id="airport-info">
+      <dt>代理池总量</dt><dd id="apt-pool">—</dd>
+      <dt>已验证可用</dt><dd id="apt-verified">—</dd>
+      <dt>上次导入</dt><dd id="apt-last">—</dd>
+    </dl>
+    <div class="btn-row" style="margin-top:.6rem">
+      <button class="btn sm ok" onclick="airportFetchVerify()">🔍 拉取+验证40个</button>
+      <button class="btn sm" onclick="airportRefresh()">🔄 刷新状态</button>
+    </div>
+    <div style="margin-top:.6rem;max-height:300px;overflow-y:auto" id="apt-list">
+      <div style="padding:1rem;text-align:center;color:var(--muted)">点击「拉取+验证」获取代理</div>
+    </div>
   </div>
 
   <!-- Xray 内核 (v2ray 系) -->
@@ -1484,6 +1605,33 @@ async function pollProgress() {
   }
 }
 
+
+// ─── 机场代理 ───
+async function airportRefresh() {
+  try {
+    const r = await fetch('/api/airport/status');
+    const d = await r.json();
+    $('apt-pool').textContent = d.pool_size || '—';
+    $('apt-verified').textContent = d.verified_count || '—';
+    $('apt-last').textContent = d.last_import || '—';
+    if (d.proxies && d.proxies.length) {
+      $('apt-list').innerHTML = d.proxies.map(p => 
+        `<div class="node-item"><span class="node-name">${p.url}</span><span class="node-meta"><span class="node-delay delay-good">${p.ip}</span></span></div>`
+      ).join('');
+    }
+  } catch(e) { toast('机场代理加载失败: '+e.message); }
+}
+async function airportFetchVerify() {
+  toast('正在拉取+验证代理（约需30秒）...');
+  $('apt-list').innerHTML = '<div style="padding:1rem;text-align:center">⏳ 拉取验证中...</div>';
+  try {
+    const r = await fetch('/api/airport/fetch', {method:'POST'});
+    const d = await r.json();
+    toast('完成: 验证通过 '+d.verified+'/'+d.total+' 个');
+    setTimeout(airportRefresh, 1000);
+  } catch(e) { toast('拉取失败: '+e.message); }
+}
+
 </script>
 </body>
 </html>
@@ -1628,6 +1776,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # ─── Xray 内核 API ───
+        # --- 机场代理 API ---
+        if path == "/api/airport/status":
+            self._json(airport_status())
+            return
+
         if path == "/api/xray/status":
             self._json(xray_status())
             return
@@ -1724,6 +1877,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # ─── Xray 内核 API ───
+        if path == "/api/airport/fetch":
+            self._json(airport_fetch_and_import())
+            return
+
         if path == "/api/xray/switch":
             name = body.get("name", "")
             self._json(xray_switch_node(name))
